@@ -1,0 +1,16 @@
+{
+  "name": "zg-sidecar",
+  "version": "1.0.0",
+  "description": "Tiny Node service wrapping the 0G Compute broker SDK so Scout's Python app can call 0G Compute over plain HTTP.",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@0glabs/0g-serving-broker": "^2.0.0",
+    "dotenv": "^16.4.0",
+    "ethers": "^6.13.0",
+    "express": "^4.19.0"
+  }
+}
