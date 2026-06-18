@@ -6,24 +6,20 @@ every recommendation, every chat answer is generated here, through 0G's
 decentralized inference marketplace — not a normal hosted LLM API. That's
 deliberate: 0G Compute has to be load-bearing, not a bolt-on.
 
-Setup (one-time, run once in a terminal — see SETUP_0G.md for the full
-walkthrough):
+How this actually talks to 0G: NOT a static API key against a proxy URL —
+that approach (from one version of 0G's quickstart docs) doesn't match
+how the current SDK works. Billing headers in the broker SDK are
+generated fresh per request and are single-use, which means something
+has to run the wallet/broker logic for every call. That something is a
+small Node service (zg-sidecar/) running alongside this app — see
+SETUP_0G.md for why and how it's run. This module just calls that
+sidecar over plain HTTP; no wallet, no signing, no Node *in this file*.
 
-    npm install -g @0glabs/0g-serving-broker
-    npm install -g openai          # not required at runtime, just for the CLI's own use
-    export PRIVATE_KEY=...          # testnet wallet, funded via faucet.0g.ai
-    0g-compute-cli setup-network
-    0g-compute-cli login
-    0g-compute-cli deposit --amount 3
-    0g-compute-cli inference list-providers
-    0g-compute-cli transfer-fund --provider <PROVIDER_ADDRESS> --amount 1
-    0g-compute-cli inference acknowledge-provider --provider <PROVIDER_ADDRESS>
-    0g-compute-cli inference get-secret --provider <PROVIDER_ADDRESS>
-    # -> prints ZG_SERVICE_URL and an app-sk-... secret. Put both in .env.
-
-At runtime, this module just calls that service URL with the secret as a
-bearer token, OpenAI chat-completions shape. No wallet, no signing, no
-Node — pure Python `requests`.
+Setup (one-time, see SETUP_0G.md for the full walkthrough):
+    cd zg-sidecar && npm install
+    cp .env.example .env   # fill in PRIVATE_KEY (testnet wallet, funded via faucet.0g.ai)
+    npm start              # leave this running
+    # then set ZG_SIDECAR_URL below (defaults to http://localhost:8787)
 """
 
 import os
@@ -32,17 +28,9 @@ import requests
 
 log = logging.getLogger("scout")
 
-ZG_SERVICE_URL = os.environ.get("ZG_SERVICE_URL", "").rstrip("/")
-ZG_API_SECRET  = os.environ.get("ZG_API_SECRET", "")
-ZG_MODEL       = os.environ.get("ZG_MODEL", "qwen/qwen-2.5-7b-instruct")
+ZG_SIDECAR_URL = os.environ.get("ZG_SIDECAR_URL", "http://localhost:8787").rstrip("/")
 
-COMPUTE_ENABLED = bool(ZG_SERVICE_URL and ZG_API_SECRET)
-
-if not COMPUTE_ENABLED:
-    log.warning(
-        "0G Compute not configured — set ZG_SERVICE_URL and ZG_API_SECRET. "
-        "See SETUP_0G.md. Scout cannot reason about anything without this."
-    )
+COMPUTE_ENABLED = True  # the sidecar's own /health call is the real check
 
 
 class ZGComputeError(Exception):
@@ -51,54 +39,47 @@ class ZGComputeError(Exception):
 
 def ask(messages: list, temperature: float = 0.3, max_tokens: int = 500) -> str:
     """
-    Send a chat-completions request through 0G Compute.
+    Send a chat-completions request through the zg-sidecar, which handles
+    the 0G Compute broker/billing logic on the Node side.
 
     messages: standard OpenAI-style [{"role": "system"|"user"|"assistant", "content": "..."}]
     Returns the model's text response, or raises ZGComputeError.
     """
-    if not COMPUTE_ENABLED:
-        raise ZGComputeError(
-            "0G Compute is not configured (missing ZG_SERVICE_URL / ZG_API_SECRET)."
-        )
-
-    url = f"{ZG_SERVICE_URL}/v1/proxy/chat/completions"
-    headers = {
-        "Content-Type":  "application/json",
-        "Authorization": f"Bearer {ZG_API_SECRET}",
-    }
+    url = f"{ZG_SIDECAR_URL}/chat"
     payload = {
-        "model":       ZG_MODEL,
         "messages":    messages,
         "temperature": temperature,
         "max_tokens":  max_tokens,
     }
 
     try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=30)
-        resp.raise_for_status()
+        resp = requests.post(url, json=payload, timeout=60)
+        if resp.status_code != 200:
+            try:
+                detail = resp.json()
+            except Exception:
+                detail = resp.text
+            raise ZGComputeError(f"zg-sidecar returned {resp.status_code}: {detail}")
         data = resp.json()
-        return data["choices"][0]["message"]["content"].strip()
+        return (data.get("content") or "").strip()
     except requests.exceptions.RequestException as e:
-        log.error(f"0G Compute request failed: {e}")
-        raise ZGComputeError(f"0G Compute request failed: {e}") from e
-    except (KeyError, IndexError) as e:
-        log.error(f"0G Compute returned an unexpected shape: {data if 'data' in dir() else ''}")
-        raise ZGComputeError(f"0G Compute returned an unexpected response shape: {e}") from e
+        log.error(f"zg-sidecar request failed: {e}")
+        raise ZGComputeError(
+            f"Couldn't reach the zg-sidecar at {ZG_SIDECAR_URL} — is it running? ({e})"
+        ) from e
 
 
 def health_check() -> dict:
     """
-    Quick sanity call — used by /health and at startup so a broken 0G
-    connection fails loudly instead of silently degrading every answer.
+    Calls the sidecar's own /health endpoint, which reports whether the
+    broker actually initialized (wallet, ledger, provider acknowledgment)
+    — not just whether the Node process is up.
     """
-    if not COMPUTE_ENABLED:
-        return {"ok": False, "reason": "ZG_SERVICE_URL / ZG_API_SECRET not set"}
     try:
-        reply = ask(
-            [{"role": "user", "content": "Reply with exactly the word: ok"}],
-            temperature=0.0,
-            max_tokens=5,
-        )
-        return {"ok": "ok" in reply.lower(), "model": ZG_MODEL, "raw": reply}
-    except ZGComputeError as e:
-        return {"ok": False, "reason": str(e)}
+        resp = requests.get(f"{ZG_SIDECAR_URL}/health", timeout=10)
+        data = resp.json()
+        if resp.status_code == 200 and data.get("ok"):
+            return {"ok": True, "model": data.get("model"), "provider": data.get("provider")}
+        return {"ok": False, "reason": data}
+    except requests.exceptions.RequestException as e:
+        return {"ok": False, "reason": f"Couldn't reach the zg-sidecar at {ZG_SIDECAR_URL} — is it running? ({e})"}
