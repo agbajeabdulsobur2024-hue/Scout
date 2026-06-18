@@ -19,18 +19,38 @@
        │ snapshot + deterministic signal_strength score
        ▼
 ┌─────────────────┐      ┌──────────────────────────┐
-│  reasoning.py    │ ───▶ │  zg_compute.py            │
-│  (builds prompt) │      │  → 0G Compute proxy       │  the ONLY model call
-└──────────────────┘      │  → Qwen 2.5 7B Instruct   │  in this codebase
-                           └──────────────────────────┘
-       ▲                            │
-       └────────── explanation text ┘
+│  reasoning.py    │ ───▶ │  zg_compute.py            │  Python — plain HTTP call
+│  (builds prompt) │      │  (calls the sidecar)      │
+└──────────────────┘      └──────────┬───────────────┘
+                                      │ POST /chat
+                                      ▼
+                           ┌──────────────────────────┐
+                           │  zg-sidecar (Node)        │  wallet, broker SDK,
+                           │  → 0G Compute broker      │  fresh billing headers
+                           │  → Qwen 2.5 7B Instruct   │  per request — the ONLY
+                           └──────────┬───────────────┘  model call in this app
+       ▲                              │
+       └────────── explanation text ──┘
 ```
 
 Every box above exists and runs. There is no hidden fallback to a normal
-LLM API — if `ZG_SERVICE_URL` / `ZG_API_SECRET` aren't set, `main.py`
-refuses to start (see the startup health check), rather than silently
-degrading to something that isn't 0G.
+LLM API — if the zg-sidecar (`zg-sidecar/`, see below) isn't running or
+isn't healthy, `main.py` refuses to start (see the startup health
+check), rather than silently degrading to something that isn't 0G.
+
+## Why there's a small Node sidecar
+
+`zg_compute.py` doesn't talk to 0G directly — it calls a small local
+Node service (`zg-sidecar/server.js`) over plain HTTP. This isn't
+incidental complexity: 0G Compute's current SDK generates billing
+headers that are content-specific and single-use, regenerated on every
+request via the wallet/broker, not a static reusable API key. Something
+has to run that broker logic per request, and the broker SDK is
+TypeScript/JS-only. The sidecar is that something — it's the smallest
+possible amount of Node needed to keep the rest of the app, and all the
+actual reasoning logic, in Python. See `SETUP_0G.md` for the full story
+of how this came together, including the dead ends (a CLI-based flow
+that didn't match the SDK's real behavior) along the way.
 
 ## Why this shape, specifically
 

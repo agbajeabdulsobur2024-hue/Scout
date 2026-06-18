@@ -2,7 +2,7 @@
 main.py — Scout entrypoint.
 
 Run with: python main.py
-Requires TELEGRAM_BOT_TOKEN, ZG_SERVICE_URL, ZG_API_SECRET set (see .env.example).
+Requires TELEGRAM_BOT_TOKEN set, and the zg-sidecar running (see SETUP_0G.md).
 """
 
 import logging
@@ -23,7 +23,7 @@ def main():
     if not health.get("ok"):
         log.error(f"0G Compute health check failed: {health}")
         log.error("Scout cannot reason about anything without a working 0G Compute "
-                   "connection. Fix ZG_SERVICE_URL / ZG_API_SECRET (see SETUP_0G.md) "
+                   "connection. Make sure the zg-sidecar is running (see SETUP_0G.md) "
                    "and restart.")
         sys.exit(1)
     log.info(f"0G Compute OK — model={health.get('model')}")

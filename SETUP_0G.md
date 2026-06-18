@@ -1,92 +1,105 @@
-# Setting up 0G Compute (one-time, do this in GitHub Codespaces)
+# Setting up 0G Compute for Scout
 
-This is a one-time provisioning step. Once it's done you'll have two values
-(`ZG_SERVICE_URL` and `ZG_API_SECRET`) that go in `.env` — after that, the
-running app never touches Node, a wallet, or the CLI again. All runtime
-calls are plain Python `requests` against an OpenAI-compatible REST endpoint.
+**This replaces an earlier version of this file that walked through
+`0g-compute-cli`.** That CLI's installed build turned out to be broken
+(no working shebang) and its actual command set doesn't match the
+documented inference flow — no `get-secret`, no `acknowledge-provider`.
+The 0G docs themselves are mid-migration between two SDK generations,
+and the current one generates fresh, single-use billing headers on
+every request rather than a static reusable API key. That means
+*something* has to run the wallet/broker logic per request — that's
+what `zg-sidecar/` is. You run it once, leave it running, and never
+touch a wallet or the CLI again after that.
 
-## 1. Open a Codespace on this repo, then in the terminal:
+## 1. Get a testnet wallet funded with OG tokens
 
-```bash
-node -v        # confirm Node 20+ (Codespaces default image usually has this)
-npm install -g @0glabs/0g-serving-broker
-```
+(Skip if you already did this.) Create a throwaway EVM wallet (e.g. a
+fresh MetaMask wallet) — **don't reuse one with real funds, this is
+testnet only, but treat the private key as a real secret regardless.**
+Get the address and private key, then go to **faucet.0g.ai**, paste the
+address, claim testnet OG tokens.
 
-## 2. Get a testnet wallet funded with OG tokens
+## 2. Configure and start the sidecar
 
-You need an EVM-compatible wallet (just a private key — you can generate
-one with any wallet tool, or `npx ethers-cli wallet create` style tooling,
-or even a throwaway MetaMask wallet). **Do not reuse a wallet that holds
-real funds — this is testnet only, but treat the key like a real secret.**
-
-1. Get the wallet's address and private key.
-2. Go to **faucet.0g.ai**, paste the address, claim testnet OG tokens.
-3. In the Codespace terminal:
-   ```bash
-   export PRIVATE_KEY=0x...your testnet private key...
-   ```
-
-## 3. Provision your compute account
+In the Codespace terminal:
 
 ```bash
-0g-compute-cli setup-network
-0g-compute-cli login
-0g-compute-cli deposit --amount 3
-0g-compute-cli inference list-providers
+cd zg-sidecar
+npm install
+cp .env.example .env
 ```
 
-The last command lists available inference providers — note one address.
-The Qwen 2.5 7B Instruct testnet provider used in this build is:
+Open `.env` and fill in:
 
 ```
-0xa48f01287233509FD694a22Bf840225062E67836
+PRIVATE_KEY=0x...your testnet private key...
 ```
 
-(Double-check this is still listed and active when you run `list-providers`
-— provider addresses can change. If it's gone, pick any listed provider and
-update `ZG_MODEL` in `.env` to match the model it serves.)
-
-## 4. Fund that provider and get your API secret
+Leave `PROVIDER_ADDRESS` blank — the sidecar auto-picks the first
+available inference provider on startup and prints which one it chose.
 
 ```bash
-export PROVIDER=0xa48f01287233509FD694a22Bf840225062E67836
-
-0g-compute-cli transfer-fund --provider $PROVIDER --amount 1
-0g-compute-cli inference acknowledge-provider --provider $PROVIDER
-0g-compute-cli inference get-secret --provider $PROVIDER
+npm start
 ```
 
-That last command prints something like:
+Watch the console output. You should see something like:
 
 ```
-Service URL: https://...
-API Secret: app-sk-...
+zg-sidecar: wallet address 0x...
+zg-sidecar: current ledger balance ~0 OG
+zg-sidecar: balance below 1, depositing 3 OG...
+zg-sidecar: deposit complete
+zg-sidecar: N service(s) available
+  - 0x...  model=qwen/qwen-2.5-7b-instruct  type=inference
+zg-sidecar: using provider 0x...
+zg-sidecar: provider acknowledged
+zg-sidecar: ready — endpoint=https://... model=qwen/qwen-2.5-7b-instruct
+zg-sidecar: listening on http://localhost:8787
 ```
 
-## 5. Put both values in `.env`
+**If something errors here, paste the exact console output back into
+the chat rather than guessing at a fix** — we've already hit several
+cases where the SDK's real behavior doesn't match its own docs, so the
+actual error message matters more than what any doc says should happen.
+A couple of known possibilities:
+- *Ledger balance check fails on a brand-new wallet* — the sidecar logs
+  a warning and continues; if the deposit step also fails, the ledger
+  may need creating once with a different method name in this SDK
+  version (`broker.ledger.addLedger(...)` instead of `depositFund`) —
+  tell me the exact error and I'll patch `server.js`.
+- *No services returned* — means no inference providers are currently
+  live on testnet, which is a 0G-side issue, not yours.
 
-```
-ZG_SERVICE_URL=<the service URL from step 4>
-ZG_API_SECRET=<the app-sk-... secret from step 4>
-ZG_MODEL=qwen/qwen-2.5-7b-instruct
+## 3. Verify it's reachable
+
+Leave the sidecar running in that terminal. Open a **second** terminal
+tab in the same Codespace (don't close the first one) and run:
+
+```bash
+curl http://localhost:8787/health
 ```
 
-## 6. Verify it works
+You should get back something like
+`{"ok":true,"provider":"0x...","model":"qwen/...","endpoint":"https://..."}`.
+
+## 4. Verify Scout's Python side can reach it
+
+Still in that second terminal, from the repo root:
 
 ```bash
 pip install -r requirements.txt
 python -c "from app import zg_compute; print(zg_compute.health_check())"
 ```
 
-You should see `{'ok': True, 'model': 'qwen/qwen-2.5-7b-instruct', 'raw': 'ok'}`.
-If `ok` is `False`, the error message will say why — most common issues are
-an unfunded provider (re-run `transfer-fund`) or an expired/wrong secret
-(re-run `get-secret`).
+You should see `{'ok': True, 'model': '...', 'provider': '0x...'}`. If
+`ok` is `False`, the `reason` field will say why — most likely the
+sidecar isn't running (check terminal 1) or `ZG_SIDECAR_URL` in `.env`
+doesn't match the port the sidecar actually started on.
 
-## Checking your balance anytime
+## Running both processes together later
 
-```bash
-0g-compute-cli get-account
-```
-
-or view the dashboard at **compute-marketplace.0g.ai**.
+For the actual demo, both processes need to be running: the sidecar
+(`cd zg-sidecar && npm start`) and the bot (`python main.py`), each in
+their own terminal tab. When we deploy this for real (not just local
+Codespace testing), they'll need to run as two separate services —
+we'll cross that bridge once local testing works.

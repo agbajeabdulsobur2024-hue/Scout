@@ -67,8 +67,8 @@ We're not claiming Storage integration exists until it does — see
 
 ## Setup
 
-1. `pip install -r requirements.txt`
-2. Follow `SETUP_0G.md` to provision 0G Compute access (one-time, ~10 minutes)
+1. Set up and start the 0G Compute sidecar — follow `SETUP_0G.md` (one-time wallet/funding step, then `cd zg-sidecar && npm install && npm start`, leave it running)
+2. In a separate terminal: `pip install -r requirements.txt`
 3. Create a Telegram bot via [@BotFather](https://t.me/BotFather), put the token in `.env`
 4. `python main.py`
 
@@ -76,11 +76,13 @@ We're not claiming Storage integration exists until it does — see
 
 ```
 app/
-  zg_compute.py     0G Compute client — the only LLM access point
+  zg_compute.py     Python client for the sidecar — the only LLM access point
   market_data.py    live market data + deterministic scoring
   reasoning.py       prompts + routing between data and 0G Compute
   telegram_bot.py    thin chat I/O layer
+zg-sidecar/           Node service wrapping the 0G Compute broker SDK
+  server.js           wallet, ledger, provider acknowledgment, per-request billing headers
 main.py              entrypoint + startup health check
-SETUP_0G.md          one-time 0G Compute provisioning walkthrough
+SETUP_0G.md          0G Compute setup walkthrough (and why it's shaped this way)
 ARCHITECTURE.md       fuller architecture + roadmap
 ```
