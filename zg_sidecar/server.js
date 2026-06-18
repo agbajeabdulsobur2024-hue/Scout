@@ -50,22 +50,32 @@ async function initBroker() {
 
   broker = await createZGComputeNetworkBroker(wallet);
 
-  // ── Ensure the ledger has funds ─────────────────────────────────────
+  // ── Ensure the ledger exists and has funds ──────────────────────────
+  // On a fresh wallet, getLedger() fails with BAD_DATA because the ledger
+  // hasn't been created yet. addLedger() both creates it AND funds it —
+  // safe to call even if one already exists (it just tops up the balance).
   try {
     const account = await broker.ledger.getLedger();
-    const balance = parseFloat(ethers.formatEther(account.balance ?? account.totalBalance ?? 0n));
+    // getLedger succeeded — ledger exists, check balance
+    const balance = parseFloat(
+      ethers.formatEther(account.totalbalance ?? account.balance ?? account.totalBalance ?? 0n)
+    );
     console.log(`zg-sidecar: current ledger balance ~${balance} OG`);
     if (balance < MIN_BALANCE) {
-      console.log(`zg-sidecar: balance below ${MIN_BALANCE}, depositing ${DEPOSIT_AMT} OG...`);
-      await broker.ledger.depositFund(DEPOSIT_AMT);
-      console.log("zg-sidecar: deposit complete");
+      console.log(`zg-sidecar: balance low, topping up with ${DEPOSIT_AMT} OG...`);
+      await broker.ledger.addLedger(String(DEPOSIT_AMT));
+      console.log("zg-sidecar: top-up complete");
     }
   } catch (e) {
-    console.warn(`zg-sidecar: could not check/top-up ledger balance — ${e.message}. ` +
-      `If this is your first run, the ledger may need creating manually once. Continuing anyway.`);
-    // First-time ledger creation differs across SDK versions — if this
-    // warning appears, try `await broker.ledger.addLedger(DEPOSIT_AMT)`
-    // manually once (see SETUP_0G.md troubleshooting section).
+    // Ledger doesn't exist yet (fresh wallet) — create it now
+    console.log(`zg-sidecar: ledger not found (fresh wallet), creating with ${DEPOSIT_AMT} OG...`);
+    try {
+      await broker.ledger.addLedger(String(DEPOSIT_AMT));
+      console.log("zg-sidecar: ledger created and funded");
+    } catch (addErr) {
+      console.warn(`zg-sidecar: addLedger failed — ${addErr.message}. ` +
+        `This may mean insufficient OG tokens. Claim more at faucet.0g.ai. Continuing anyway.`);
+    }
   }
 
   // ── Pick a provider ──────────────────────────────────────────────────
