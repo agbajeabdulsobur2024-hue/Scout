@@ -1,25 +1,20 @@
 """
 zg_compute.py — 0G Compute Network client.
 
+Calls the 0G Compute proxy endpoint directly with a static API key —
+no Node sidecar, no wallet signing, no broker SDK. The key is generated
+once from compute-marketplace.0g.ai (Setup → Generate API Key) and then
+works as a standard Bearer token against 0G's OpenAI-compatible proxy.
+
 This is the ONLY place in Scout that talks to an LLM. Every explanation,
-every recommendation, every chat answer is generated here, through 0G's
-decentralized inference marketplace — not a normal hosted LLM API. That's
-deliberate: 0G Compute has to be load-bearing, not a bolt-on.
+every recommendation, every chat answer goes through 0G Compute's
+decentralized inference network — not a normal hosted LLM API.
 
-How this actually talks to 0G: NOT a static API key against a proxy URL —
-that approach (from one version of 0G's quickstart docs) doesn't match
-how the current SDK works. Billing headers in the broker SDK are
-generated fresh per request and are single-use, which means something
-has to run the wallet/broker logic for every call. That something is a
-small Node service (zg-sidecar/) running alongside this app — see
-SETUP_0G.md for why and how it's run. This module just calls that
-sidecar over plain HTTP; no wallet, no signing, no Node *in this file*.
-
-Setup (one-time, see SETUP_0G.md for the full walkthrough):
-    cd zg-sidecar && npm install
-    cp .env.example .env   # fill in PRIVATE_KEY (testnet wallet, funded via faucet.0g.ai)
-    npm start              # leave this running
-    # then set ZG_SIDECAR_URL below (defaults to http://localhost:8787)
+Required env vars (put in .env at repo root):
+    ZG_SERVICE_URL   — from the CLI tab on compute-marketplace.0g.ai
+                       e.g. https://compute-network-6.integratenetwork.work/v1/proxy
+    ZG_API_SECRET    — your app-sk-... key from Generate API Key step
+    ZG_MODEL         — defaults to qwen/qwen2.5-omni-7b
 """
 
 import os
@@ -28,9 +23,21 @@ import requests
 
 log = logging.getLogger("scout")
 
-ZG_SIDECAR_URL = os.environ.get("ZG_SIDECAR_URL", "http://localhost:8787").rstrip("/")
+ZG_SERVICE_URL = os.environ.get(
+    "ZG_SERVICE_URL",
+    "https://compute-network-6.integratenetwork.work/v1/proxy"
+).rstrip("/")
 
-COMPUTE_ENABLED = True  # the sidecar's own /health call is the real check
+ZG_API_SECRET  = os.environ.get("ZG_API_SECRET", "")
+ZG_MODEL       = os.environ.get("ZG_MODEL", "qwen/qwen2.5-omni-7b")
+
+COMPUTE_ENABLED = bool(ZG_API_SECRET)
+
+if not COMPUTE_ENABLED:
+    log.warning(
+        "ZG_API_SECRET is not set. Put your app-sk-... key in .env. "
+        "Get it from compute-marketplace.0g.ai → Build → Generate API Key."
+    )
 
 
 class ZGComputeError(Exception):
@@ -39,47 +46,55 @@ class ZGComputeError(Exception):
 
 def ask(messages: list, temperature: float = 0.3, max_tokens: int = 500) -> str:
     """
-    Send a chat-completions request through the zg-sidecar, which handles
-    the 0G Compute broker/billing logic on the Node side.
+    Send a chat-completions request through 0G Compute.
 
-    messages: standard OpenAI-style [{"role": "system"|"user"|"assistant", "content": "..."}]
+    messages: standard OpenAI-style list of
+              {"role": "system"|"user"|"assistant", "content": "..."}
     Returns the model's text response, or raises ZGComputeError.
     """
-    url = f"{ZG_SIDECAR_URL}/chat"
+    if not COMPUTE_ENABLED:
+        raise ZGComputeError(
+            "ZG_API_SECRET is not set — cannot reach 0G Compute."
+        )
+
+    url     = f"{ZG_SERVICE_URL}/chat/completions"
+    headers = {
+        "Content-Type":  "application/json",
+        "Authorization": f"Bearer {ZG_API_SECRET}",
+    }
     payload = {
+        "model":       ZG_MODEL,
         "messages":    messages,
         "temperature": temperature,
         "max_tokens":  max_tokens,
     }
 
     try:
-        resp = requests.post(url, json=payload, timeout=60)
-        if resp.status_code != 200:
-            try:
-                detail = resp.json()
-            except Exception:
-                detail = resp.text
-            raise ZGComputeError(f"zg-sidecar returned {resp.status_code}: {detail}")
+        resp = requests.post(url, headers=headers, json=payload, timeout=60)
+        resp.raise_for_status()
         data = resp.json()
-        return (data.get("content") or "").strip()
+        return data["choices"][0]["message"]["content"].strip()
     except requests.exceptions.RequestException as e:
-        log.error(f"zg-sidecar request failed: {e}")
-        raise ZGComputeError(
-            f"Couldn't reach the zg-sidecar at {ZG_SIDECAR_URL} — is it running? ({e})"
-        ) from e
+        log.error(f"0G Compute request failed: {e}")
+        raise ZGComputeError(f"0G Compute request failed: {e}") from e
+    except (KeyError, IndexError) as e:
+        log.error(f"0G Compute unexpected response shape: {resp.text[:200]}")
+        raise ZGComputeError(f"0G Compute returned unexpected response: {e}") from e
 
 
 def health_check() -> dict:
     """
-    Calls the sidecar's own /health endpoint, which reports whether the
-    broker actually initialized (wallet, ledger, provider acknowledgment)
-    — not just whether the Node process is up.
+    Quick sanity call — confirms the endpoint and API key both work.
+    Called at startup so a broken connection fails loudly.
     """
+    if not COMPUTE_ENABLED:
+        return {"ok": False, "reason": "ZG_API_SECRET not set"}
     try:
-        resp = requests.get(f"{ZG_SIDECAR_URL}/health", timeout=10)
-        data = resp.json()
-        if resp.status_code == 200 and data.get("ok"):
-            return {"ok": True, "model": data.get("model"), "provider": data.get("provider")}
-        return {"ok": False, "reason": data}
-    except requests.exceptions.RequestException as e:
-        return {"ok": False, "reason": f"Couldn't reach the zg-sidecar at {ZG_SIDECAR_URL} — is it running? ({e})"}
+        reply = ask(
+            [{"role": "user", "content": "Reply with exactly the word: ok"}],
+            temperature=0.0,
+            max_tokens=5,
+        )
+        return {"ok": "ok" in reply.lower(), "model": ZG_MODEL, "raw": reply}
+    except ZGComputeError as e:
+        return {"ok": False, "reason": str(e)}
