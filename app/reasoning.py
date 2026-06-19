@@ -141,3 +141,62 @@ def route_message(text: str, recent_context: list = None) -> str:
     if any(w in text.lower() for w in _OPPORTUNITY_WORDS):
         return best_opportunities()
     return chat(text, recent_context=recent_context)
+
+
+def explain_structure(symbol: str) -> str:
+    """
+    '/bias BTC' — full SMC structure picture for one symbol:
+    HTF bias, recent sweep, last BOS, inducement zones.
+    """
+    from app.market_data import get_klines
+    from app.structure import full_structure_snapshot
+
+    try:
+        candles_h1    = get_klines(symbol, "1h",  50)
+        candles_h4    = get_klines(symbol, "4h",  50)
+        candles_daily = get_klines(symbol, "1d",  30)
+        snap = full_structure_snapshot(symbol, candles_h1, candles_h4, candles_daily)
+    except Exception as e:
+        return f"Couldn't fetch structure data for {symbol}: {e}"
+
+    bias       = snap.get("bias", "neutral")
+    bias_data  = snap.get("bias_data", {})
+    sweep      = snap.get("recent_sweep")
+    bos        = snap.get("bos_h1", {})
+    inducements= snap.get("inducement_zones", [])
+    price      = snap.get("current_price", 0)
+
+    context_lines = [
+        f"Symbol: {symbol}",
+        f"Current price: {price:.4f}",
+        f"HTF bias: {bias.upper()}",
+        f"Daily note: {bias_data.get('daily_note', '')}",
+        f"H4 note: {bias_data.get('h4_note', '')}",
+    ]
+    if sweep:
+        context_lines.append(f"Recent H1 sweep: {sweep.get('description', '')}")
+    if bos.get("broken"):
+        context_lines.append(f"Last H1 BOS: {bos.get('description', '')}")
+    if inducements:
+        zones = ", ".join(
+            f"{z['price']:.4f} ({z['distance_pct']:+.1f}%)"
+            for z in inducements[:3]
+        )
+        context_lines.append(f"Inducement zones: {zones}")
+
+    context = "\n".join(context_lines)
+    question = (
+        "Based on this structure data, give the trader:\n"
+        "1. The overall bias and why\n"
+        "2. What the recent sweep or BOS means\n"
+        "3. The most important inducement zones to watch\n"
+        "4. What to look for to confirm a trade setup\n"
+        "Keep it under 150 words."
+    )
+    try:
+        return ask([
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": f"{context}\n\n{question}"},
+        ], max_tokens=300)
+    except ZGComputeError as e:
+        return f"Structure data:\n{context}\n\n⚠️ 0G Compute unavailable: {e}"
