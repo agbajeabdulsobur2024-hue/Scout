@@ -168,3 +168,67 @@ initBroker()
     console.error(`zg-sidecar: fatal startup error — ${e.message}`);
     process.exit(1);
   });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 0G STORAGE — upload/download JSON state
+// Uses @0glabs/0g-ts-sdk with MemData so nothing touches the filesystem.
+// Root hash is the permanent address of each upload on 0G Storage.
+// Scout uses this for persistent market memory that survives restarts.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const STORAGE_INDEXER  = process.env.STORAGE_INDEXER  || "https://indexer-storage-testnet-turbo.0g.ai";
+const STORAGE_EVM_RPC  = process.env.STORAGE_EVM_RPC  || RPC_URL;
+let storageWallet = null;
+
+async function getStorageWallet() {
+  if (storageWallet) return storageWallet;
+  const provider = new ethers.JsonRpcProvider(STORAGE_EVM_RPC);
+  storageWallet  = new ethers.Wallet(PRIVATE_KEY, provider);
+  return storageWallet;
+}
+
+app.post("/storage/upload", async (req, res) => {
+  const payload = req.body;
+  if (!payload) return res.status(400).json({ error: "body required" });
+  try {
+    const { Indexer, MemData } = require("@0glabs/0g-ts-sdk");
+    const wallet  = await getStorageWallet();
+    const indexer = new Indexer(STORAGE_INDEXER);
+    const bytes   = new TextEncoder().encode(JSON.stringify(payload));
+    const memData = new MemData(bytes);
+    const [tx, err] = await indexer.upload(memData, STORAGE_EVM_RPC, wallet);
+    if (err) {
+      console.error(`zg-storage: upload error — ${err}`);
+      return res.status(502).json({ error: String(err) });
+    }
+    // tx is the root hash (permanent address on 0G Storage)
+    console.log(`zg-storage: uploaded, root=${tx}`);
+    res.json({ ok: true, root: tx });
+  } catch (e) {
+    console.error(`zg-storage: upload exception — ${e.message}`);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get("/storage/download/:root", async (req, res) => {
+  const root = req.params.root;
+  if (!root) return res.status(400).json({ error: "root hash required" });
+  try {
+    const { Indexer } = require("@0glabs/0g-ts-sdk");
+    const indexer = new Indexer(STORAGE_INDEXER);
+    // Download to a temp buffer — false = skip proof verification for speed
+    const tmpPath = `/tmp/zg_dl_${Date.now()}`;
+    const err = await indexer.download(root, tmpPath, false);
+    if (err) {
+      console.error(`zg-storage: download error — ${err}`);
+      return res.status(502).json({ error: String(err) });
+    }
+    const fs   = require("fs");
+    const data = fs.readFileSync(tmpPath, "utf8");
+    fs.unlinkSync(tmpPath);
+    res.json({ ok: true, data: JSON.parse(data) });
+  } catch (e) {
+    console.error(`zg-storage: download exception — ${e.message}`);
+    res.status(500).json({ error: e.message });
+  }
+});
