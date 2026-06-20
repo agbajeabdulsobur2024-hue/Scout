@@ -148,43 +148,53 @@ def handle_update(update: dict) -> None:
         return
 
     if text.startswith("/crimes"):
-        from app.mexc_data import get_top_movers
-        send_message(chat_id, "🔍 Fetching MEXC top movers...")
-        movers = get_top_movers(top_n=20)
-        if not movers["gainers"] and not movers["losers"]:
-            send_message(chat_id, "⚠️ Could not reach MEXC API right now. Try again in a moment.")
-            return
+        send_message(chat_id, "🔍 Fetching MEXC top 20 movers...")
+        try:
+            import requests as _req
+            resp = _req.get(
+                "https://contract.mexc.com/api/v1/contract/ticker",
+                timeout=15
+            )
+            raw = resp.json().get("data", [])
+            tickers = []
+            for t in raw:
+                sym = t.get("symbol", "")
+                if not sym.endswith("_USDT"):
+                    continue
+                try:
+                    tickers.append({
+                        "symbol":     sym.replace("_USDT", ""),
+                        "change_pct": float(t.get("priceChangePercent", 0)),
+                        "volume":     float(t.get("volume24", 0)),
+                    })
+                except Exception:
+                    continue
 
-        gain_lines = ["📈 <b>TOP 20 GAINERS</b>\n"]
-        for i, m in enumerate(movers["gainers"], 1):
-            sym  = m["symbol"].replace("_USDT", "")
-            chg  = m["change_pct"]
-            vol  = m.get("volume_24h", 0)
-            flag = "🚨" if abs(chg) > 30 else "⚠️" if abs(chg) > 15 else "📈"
-            gain_lines.append(f"{flag} {i}. <b>{sym}</b>  {chg:+.1f}%  vol:{vol:,.0f}")
+            if not tickers:
+                send_message(chat_id, "⚠️ MEXC data unavailable right now. Try again.")
+                return
 
-        loss_lines = ["\n📉 <b>TOP 20 LOSERS</b>\n"]
-        for i, m in enumerate(movers["losers"], 1):
-            sym  = m["symbol"].replace("_USDT", "")
-            chg  = m["change_pct"]
-            vol  = m.get("volume_24h", 0)
-            flag = "🚨" if abs(chg) > 30 else "⚠️" if abs(chg) > 15 else "📉"
-            loss_lines.append(f"{flag} {i}. <b>{sym}</b>  {chg:+.1f}%  vol:{vol:,.0f}")
+            sorted_t  = sorted(tickers, key=lambda x: x["change_pct"])
+            losers     = sorted_t[:20]
+            gainers    = sorted_t[-20:][::-1]
 
-        send_message(chat_id, "\n".join(gain_lines))
-        send_message(chat_id, "\n".join(loss_lines))
+            gain_lines = ["📈 <b>TOP 20 GAINERS</b>\n"]
+            for i, m in enumerate(gainers, 1):
+                chg  = m["change_pct"]
+                flag = "🚨" if chg > 30 else "⚠️" if chg > 15 else "📈"
+                gain_lines.append(f"{flag} {i}. <b>{m['symbol']}</b>  {chg:+.1f}%")
 
-        # Ask 0G to explain the most extreme mover
-        extreme = max(
-            movers["gainers"][:1] + movers["losers"][:1],
-            key=lambda x: abs(x["change_pct"]),
-            default=None
-        )
-        if extreme:
-            from app.reasoning import explain_crime_move
-            commentary = explain_crime_move(extreme)
-            if commentary:
-                send_message(chat_id, f"🤖 <b>Scout's read on the biggest mover:</b>\n\n{commentary}")
+            loss_lines = ["\n📉 <b>TOP 20 LOSERS</b>\n"]
+            for i, m in enumerate(losers, 1):
+                chg  = m["change_pct"]
+                flag = "🚨" if chg < -30 else "⚠️" if chg < -15 else "📉"
+                loss_lines.append(f"{flag} {i}. <b>{m['symbol']}</b>  {chg:+.1f}%")
+
+            send_message(chat_id, "\n".join(gain_lines))
+            send_message(chat_id, "\n".join(loss_lines))
+
+        except Exception as e:
+            send_message(chat_id, f"⚠️ MEXC fetch failed: {e}")
         return
 
     if text.startswith("/scan"):
