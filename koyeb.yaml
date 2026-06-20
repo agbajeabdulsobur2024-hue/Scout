@@ -1,0 +1,37 @@
+# koyeb.yaml — Scout deployment config
+# Deploy as a Web Service (not Worker) so Koyeb's health checks
+# hit GET /health every 30s, keeping the free instance awake 24/7.
+# The Telegram polling loop runs in the same process alongside the
+# tiny HTTP health server.
+
+services:
+  - name: scout
+    type: web
+    instance_type: free
+    regions:
+      - was  # Washington DC — lower latency to Telegram servers
+    github:
+      branch: main
+      build_command: pip install -r requirements.txt
+      run_command: python main.py
+    ports:
+      - port: 8080
+        protocol: http
+    health_checks:
+      - path: /health
+        port: 8080
+        interval: 30
+        timeout: 5
+    env:
+      - key: PORT
+        value: "8080"
+      - key: ZG_SERVICE_URL
+        secret: true
+      - key: ZG_API_SECRET
+        secret: true
+      - key: ZG_MODEL
+        value: qwen/qwen2.5-omni-7b
+      - key: TELEGRAM_BOT_TOKEN
+        secret: true
+      - key: ZG_SIDECAR_URL
+        secret: true
