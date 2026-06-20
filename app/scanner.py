@@ -37,6 +37,76 @@ _send_fn = None               # set by start_scanner() to telegram_bot.send_mess
 _chat_id = None               # set by start_scanner()
 _running = False
 
+# ── User watchlists ────────────────────────────────────────────────────────
+# Stores per-user custom monitoring requests.
+# Format: {chat_id: [{symbol, tf, conditions, note}]}
+_user_watchlists: dict = {}
+
+
+def add_user_monitor(chat_id: int, symbol: str, tf: str = "1h",
+                     conditions: list = None, note: str = "") -> str:
+    """
+    Register a symbol for a user's personal watchlist.
+    The scanner will check this symbol on every structure scan and alert
+    that specific user when conditions are met.
+    """
+    symbol = symbol.upper()
+    if not symbol.endswith("USDT"):
+        symbol = symbol + "USDT"
+
+    entry = {
+        "symbol":     symbol,
+        "tf":         tf,
+        "conditions": conditions or ["sweep", "bos"],
+        "note":       note,
+    }
+    if chat_id not in _user_watchlists:
+        _user_watchlists[chat_id] = []
+
+    # Don't add duplicates
+    existing = [w["symbol"] for w in _user_watchlists[chat_id]]
+    if symbol in existing:
+        return f"{symbol} is already on your watchlist."
+
+    _user_watchlists[chat_id].append(entry)
+    log.info(f"scanner: {chat_id} added {symbol} to personal watchlist")
+    return (
+        f"✅ Now monitoring {symbol} on {tf.upper()} for "
+        f"{', '.join(entry['conditions'])}.\n"
+        f"You'll get an alert the moment something happens."
+        + (f"\nNote: {note}" if note else "")
+    )
+
+
+def remove_user_monitor(chat_id: int, symbol: str) -> str:
+    """Remove a symbol from a user's personal watchlist."""
+    symbol = symbol.upper()
+    if not symbol.endswith("USDT"):
+        symbol = symbol + "USDT"
+    if chat_id not in _user_watchlists:
+        return f"{symbol} wasn't on your watchlist."
+    before = len(_user_watchlists[chat_id])
+    _user_watchlists[chat_id] = [
+        w for w in _user_watchlists[chat_id] if w["symbol"] != symbol
+    ]
+    if len(_user_watchlists[chat_id]) < before:
+        return f"✅ Stopped monitoring {symbol}."
+    return f"{symbol} wasn't on your watchlist."
+
+
+def list_user_monitors(chat_id: int) -> str:
+    """Return a formatted list of what's being monitored for a user."""
+    watches = _user_watchlists.get(chat_id, [])
+    if not watches:
+        return "Your watchlist is empty. Say 'monitor BTCUSDT on 1H for sweeps' to add one."
+    lines = ["<b>Your active monitors:</b>\n"]
+    for w in watches:
+        conds = ", ".join(w["conditions"])
+        lines.append(f"• <b>{w['symbol']}</b> — {w['tf'].upper()} — {conds}")
+        if w.get("note"):
+            lines.append(f"  {w['note']}")
+    return "\n".join(lines)
+
 
 def _is_cooled_down(key: str) -> bool:
     last = _alert_cooldowns.get(key, 0)
@@ -260,7 +330,84 @@ def _structure_loop():
     time.sleep(60)
     while _running:
         run_structure_scan()
+        _run_user_watchlist_scan()
         time.sleep(STRUCTURE_SCAN_INTERVAL)
+
+
+def _run_user_watchlist_scan():
+    """Scan each user's personal watchlist and alert that specific user."""
+    if not _user_watchlists:
+        return
+    try:
+        from app.market_data import get_klines
+        from app.structure import full_structure_snapshot
+
+        for chat_id, watches in _user_watchlists.items():
+            for watch in watches:
+                symbol = watch["symbol"]
+                tf     = watch.get("tf", "1h")
+                conds  = watch.get("conditions", ["sweep", "bos"])
+                try:
+                    candles_h1    = get_klines(symbol, tf,   50)
+                    candles_h4    = get_klines(symbol, "4h", 50)
+                    candles_daily = get_klines(symbol, "1d", 30)
+                    snap = full_structure_snapshot(symbol, candles_h1, candles_h4, candles_daily)
+
+                    bias   = snap.get("bias", "neutral")
+                    sweep  = snap.get("recent_sweep")
+                    bos    = snap.get("bos_h1", {})
+                    indu   = snap.get("inducement_zones", [])
+                    price  = snap.get("current_price", 0)
+
+                    if "sweep" in conds and sweep and sweep.get("age_candles", 99) <= 3:
+                        key = f"user_{chat_id}_sweep_{symbol}_{round(sweep['level'], 2)}"
+                        if _is_cooled_down(key):
+                            explanation = _explain_sweep(symbol, sweep, snap["bias_data"])
+                            sym_short = symbol.replace("USDT", "")
+                            msg_lines = [
+                                f"🎯 <b>YOUR WATCHLIST ALERT — {sym_short}</b>",
+                                f"",
+                                f"{sweep['description']}",
+                                f"Bias: <b>{bias.upper()}</b>  |  Price: {price:.4f}",
+                            ]
+                            if indu:
+                                z = indu[0]
+                                msg_lines.append(f"Next inducement: {z['price']:.4f} ({z['distance_pct']:+.1f}%)")
+                            if explanation:
+                                msg_lines += ["", explanation]
+                            if watch.get("note"):
+                                msg_lines.append(f"\n📌 Your note: {watch['note']}")
+                            msg_lines.append(f"\n{datetime.now(timezone.utc).strftime('%H:%M UTC')}")
+                            if _send_fn:
+                                _send_fn(chat_id, "\n".join(msg_lines))
+                            _mark_alerted(key)
+
+                    if "bos" in conds and bos.get("broken") and bos.get("candle_idx", 0) >= len(candles_h1) - 5:
+                        bos_bias = bos.get("bias", "")
+                        key = f"user_{chat_id}_bos_{symbol}_{round(bos.get('level',0),2)}_{bos_bias}"
+                        if _is_cooled_down(key):
+                            sym_short = symbol.replace("USDT", "")
+                            msg_lines = [
+                                f"⚡ <b>YOUR WATCHLIST ALERT — {sym_short}</b>",
+                                f"",
+                                f"{bos.get('description', '')}",
+                                f"HTF Bias: <b>{bias.upper()}</b>",
+                                f"Alignment: {'✅ WITH bias' if bos_bias == bias else '⚠️ AGAINST bias'}",
+                            ]
+                            if indu:
+                                z = indu[0]
+                                msg_lines.append(f"Next inducement: {z['price']:.4f} ({z['distance_pct']:+.1f}%)")
+                            if watch.get("note"):
+                                msg_lines.append(f"\n📌 Your note: {watch['note']}")
+                            msg_lines.append(f"\n{datetime.now(timezone.utc).strftime('%H:%M UTC')}")
+                            if _send_fn:
+                                _send_fn(chat_id, "\n".join(msg_lines))
+                            _mark_alerted(key)
+
+                except Exception as e:
+                    log.debug(f"user watchlist scan {symbol} for {chat_id}: {e}")
+    except Exception as e:
+        log.error(f"_run_user_watchlist_scan error: {e}")
 
 
 def start_scanner(send_fn, chat_id: int):
