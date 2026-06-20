@@ -226,10 +226,39 @@ def scan_for_crimes(top_n: int = 20) -> list:
     return results[:top_n]
 
 
-def get_top_movers(top_n: int = 10) -> dict:
+def get_all_tickers() -> list:
     """
-    Simple top gainers/losers — used for the /movers command.
+    Pull the full MEXC futures ticker feed — all USDT perpetuals.
+    Returns a list of dicts with symbol, price, change_pct, volume etc.
     """
+    try:
+        resp = requests.get(f"{BASE}/ticker", timeout=15)
+        resp.raise_for_status()
+        raw = resp.json().get("data", [])
+        out = []
+        for t in raw:
+            sym = t.get("symbol", "")
+            if not sym.endswith("_USDT"):
+                continue
+            try:
+                out.append({
+                    "symbol":      sym,
+                    "price":       float(t.get("lastPrice", 0)),
+                    "change_pct":  float(t.get("priceChangePercent", 0)),
+                    "volume_24h":  float(t.get("volume24", 0)),
+                    "high_24h":    float(t.get("high24Price", 0)),
+                    "low_24h":     float(t.get("low24Price", 0)),
+                })
+            except (ValueError, TypeError):
+                continue
+        return out
+    except Exception as e:
+        log.warning(f"MEXC get_all_tickers failed: {e}")
+        return []
+
+
+def get_top_movers(top_n: int = 20) -> dict:
+    """Top gainers and losers across all MEXC USDT perpetuals."""
     tickers = get_all_tickers()
     if not tickers:
         return {"gainers": [], "losers": []}
