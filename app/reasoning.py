@@ -87,39 +87,112 @@ def explain_symbol(symbol: str, user_question: str = "") -> str:
 
 def best_opportunities(symbols: list = None, top_n: int = 3) -> str:
     """
-    'What are the best setups right now?' — snapshot the watchlist, sort
-    by the deterministic signal-strength score, ask 0G Compute to explain
-    the top N in trader-readable language.
+    SMC-based opportunity scan — replaces the old volume/range signal strength.
+    Scans the watchlist for symbols with confirmed sweep + displacement,
+    ranks by HTF bias alignment and displacement quality.
+    0G Compute explains the top setups.
     """
-    snaps = market_data.watchlist_snapshot(symbols)
-    snaps = [s for s in snaps if s.get("ticker")]
-    snaps.sort(key=lambda s: s.get("signal_strength", 0), reverse=True)
-    top = snaps[:top_n]
+    from app.market_data import get_klines
+    from app.structure import full_structure_snapshot
 
-    if not top:
-        return "No market data available right now — try again in a moment."
+    symbols = symbols or market_data.DEFAULT_WATCHLIST
+    results = []
 
-    blocks = "\n\n".join(_format_snapshot(s) for s in top)
-    question = (
-        f"Here is data for the {len(top)} symbols with the highest computed "
-        f"signal-strength score from a larger watchlist. For each one, explain "
-        f"in 1-2 sentences what's notable about it and why it scored highly. "
-        f"Order your answer to match the order given."
+    for symbol in symbols:
+        try:
+            c1h = get_klines(symbol, "1h", 50)
+            c4h = get_klines(symbol, "4h", 50)
+            cd  = get_klines(symbol, "1d", 30)
+            snap = full_structure_snapshot(symbol, c1h, c4h, cd)
+
+            sweep = snap.get("recent_sweep")
+            disp  = snap.get("displacement", {})
+            bos   = snap.get("bos_h1", {})
+            bias  = snap.get("bias", "neutral")
+            indu  = snap.get("inducement_zones", [])
+            price = snap.get("current_price", 0)
+
+            # Score: sweep + displacement = strongest, BOS alone = moderate
+            score = 0
+            if sweep and sweep.get("entry_valid"):
+                score += 40
+                if disp.get("confirmed"):
+                    score += 40
+                if sweep.get("has_rejection"):
+                    score += 10
+                if sweep.get("is_equal_hl"):
+                    score += 10
+            elif bos.get("broken"):
+                score += 30
+
+            # Bias alignment bonus
+            if bias != "neutral":
+                score += 10
+
+            if score > 0:
+                results.append({
+                    "symbol": symbol,
+                    "score":  score,
+                    "bias":   bias,
+                    "sweep":  sweep,
+                    "disp":   disp,
+                    "bos":    bos,
+                    "indu":   indu,
+                    "price":  price,
+                    "snap":   snap,
+                })
+        except Exception as e:
+            log.debug(f"best_opportunities {symbol}: {e}")
+
+    if not results:
+        return (
+            "No confirmed SMC setups across the watchlist right now.\n"
+            "Scanner checks every 10 minutes — you'll get an alert when one forms."
+        )
+
+    results.sort(key=lambda x: x["score"], reverse=True)
+    top = results[:top_n]
+
+    # Build context for 0G Compute
+    blocks = []
+    for r in top:
+        sym   = r["symbol"].replace("USDT", "")
+        bias  = r["bias"].upper()
+        sweep = r["sweep"]
+        disp  = r["disp"]
+        bos   = r["bos"]
+        indu  = r["indu"]
+
+        lines = [f"Symbol: {sym}  |  Bias: {bias}  |  Price: {r['price']:.4f}"]
+        if sweep:
+            lines.append(f"Sweep: {sweep.get('description', '')}")
+        if disp.get("confirmed"):
+            lines.append(f"Displacement: {disp.get('description', '')}")
+        if bos.get("broken"):
+            lines.append(f"BOS: {bos.get('description', '')}")
+        if indu:
+            lines.append(f"Next inducement: {indu[0]['price']:.4f} ({indu[0]['distance_pct']:+.1f}%)")
+        blocks.append("\n".join(lines))
+
+    context   = "\n\n".join(blocks)
+    header    = "\n".join(
+        f"{i+1}. {r['symbol'].replace('USDT','')}  — setup score {r['score']}/100  ({r['bias'].upper()} bias)"
+        for i, r in enumerate(top)
     )
+    question  = (
+        "These are the highest-scoring SMC setups right now based on sweep, "
+        "displacement, and bias alignment. For each one, give a 1-2 sentence "
+        "read: is this worth watching, what confirms it, what invalidates it."
+    )
+
     try:
         explanation = ask([
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"{blocks}\n\n{question}"},
-        ], max_tokens=400)
+            {"role": "user",   "content": f"{context}\n\n{question}"},
+        ], max_tokens=350)
+        return f"{header}\n\n{explanation}"
     except ZGComputeError as e:
-        log.error(f"best_opportunities failed: {e}")
-        explanation = f"⚠️ Couldn't reach 0G Compute right now ({e})."
-
-    header = "\n".join(
-        f"{i+1}. {s['symbol']} — signal strength {s.get('signal_strength', 0)}/100"
-        for i, s in enumerate(top)
-    )
-    return f"{header}\n\n{explanation}"
+        return f"{header}\n\n⚠️ 0G Compute unavailable: {e}"
 
 
 def chat(message: str, recent_context: list = None) -> str:
