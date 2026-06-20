@@ -165,8 +165,10 @@ initBroker()
     app.listen(PORT, () => console.log(`zg-sidecar: listening on http://localhost:${PORT}`));
   })
   .catch(e => {
-    console.error(`zg-sidecar: fatal startup error — ${e.message}`);
-    process.exit(1);
+    console.error(`zg-sidecar: broker init failed — ${e.message}`);
+    console.error(`zg-sidecar: /chat will return 503. Storage endpoints still available.`);
+    // Don't exit — storage routes work independently from the broker.
+    app.listen(PORT, () => console.log(`zg-sidecar: listening on http://localhost:${PORT} (storage-only mode)`));
   });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -182,8 +184,10 @@ let storageWallet = null;
 
 async function getStorageWallet() {
   if (storageWallet) return storageWallet;
+  // Storage wallet is independent from the broker — works even if broker fails
   const provider = new ethers.JsonRpcProvider(STORAGE_EVM_RPC);
   storageWallet  = new ethers.Wallet(PRIVATE_KEY, provider);
+  console.log(`zg-sidecar: storage wallet ready — ${storageWallet.address}`);
   return storageWallet;
 }
 
