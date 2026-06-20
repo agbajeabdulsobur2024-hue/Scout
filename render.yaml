@@ -1,0 +1,16 @@
+services:
+  - type: worker
+    name: scout
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    plan: free
+    envVars:
+      - key: ZG_SERVICE_URL
+        sync: false
+      - key: ZG_API_SECRET
+        sync: false
+      - key: ZG_MODEL
+        value: qwen/qwen2.5-omni-7b
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
