@@ -165,7 +165,24 @@ def route_message(text: str, recent_context: list = None) -> str:
     return chat(text, recent_context=recent_context)
 
 
-def explain_structure(symbol: str) -> str:
+def explain_crime_move(mover: dict) -> str:
+    """Ask 0G Compute to explain the most extreme MEXC mover."""
+    try:
+        sym = mover["symbol"].replace("_USDT", "")
+        chg = mover["change_pct"]
+        vol = mover.get("volume_24h", 0)
+        prompt = (
+            f"MEXC futures — {sym}/USDT moved {chg:+.1f}% in 24h "
+            f"with volume {vol:,.0f}.\n\n"
+            f"In 2-3 sentences: does this look coordinated or organic? "
+            f"What should a trader watch for — continuation, reversal, or trap?"
+        )
+        return ask([
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user",   "content": prompt},
+        ], max_tokens=120)
+    except Exception:
+        return ""
     """
     '/bias BTC' — full SMC structure picture for one symbol:
     HTF bias, recent sweep, last BOS, inducement zones.
@@ -188,6 +205,10 @@ def explain_structure(symbol: str) -> str:
     inducements= snap.get("inducement_zones", [])
     price      = snap.get("current_price", 0)
 
+    # ── Funding rate intelligence ─────────────────────────────────────────
+    from app.market_data import get_funding_intelligence
+    funding = get_funding_intelligence(symbol, bias=bias)
+
     context_lines = [
         f"Symbol: {symbol}",
         f"Current price: {price:.4f}",
@@ -205,6 +226,25 @@ def explain_structure(symbol: str) -> str:
             for z in inducements[:3]
         )
         context_lines.append(f"Inducement zones: {zones}")
+    if not funding.get("error"):
+        context_lines.append(f"Funding rate: {funding.get('read', '')}")
+        if funding.get("settlement_warning"):
+            context_lines.append("⚠️ WARNING: Within 30 min of funding settlement — high volatility risk")
+
+    # ── Displacement + OB ────────────────────────────────────────────────
+    displacement = snap.get("displacement", {})
+    order_block  = snap.get("order_block", {})
+    if displacement.get("confirmed"):
+        context_lines.append(f"Displacement: {displacement.get('description', '')}")
+        if order_block.get("found"):
+            context_lines.append(f"Order Block: {order_block.get('description', '')}")
+            context_lines.append(
+                f"OB zone: {order_block.get('low', 0):.4f} – {order_block.get('high', 0):.4f}"
+            )
+    else:
+        context_lines.append(
+            f"Displacement: {displacement.get('description', displacement.get('reason', 'not confirmed'))}"
+        )
 
     context = "\n".join(context_lines)
     question = (

@@ -70,6 +70,11 @@ def add_user_monitor(chat_id: int, symbol: str, tf: str = "1h",
 
     _user_watchlists[chat_id].append(entry)
     log.info(f"scanner: {chat_id} added {symbol} to personal watchlist")
+
+    # Persist to 0G Storage so watchlist survives restarts
+    import threading
+    threading.Thread(target=_persist_state, daemon=True).start()
+
     return (
         f"✅ Now monitoring {symbol} on {tf.upper()} for "
         f"{', '.join(entry['conditions'])}.\n"
@@ -94,7 +99,13 @@ def remove_user_monitor(chat_id: int, symbol: str) -> str:
     return f"{symbol} wasn't on your watchlist."
 
 
-def list_user_monitors(chat_id: int) -> str:
+def clear_all_monitors(chat_id: int) -> str:
+    """Remove all monitors for a user."""
+    if chat_id in _user_watchlists:
+        count = len(_user_watchlists[chat_id])
+        _user_watchlists[chat_id] = []
+        return f"✅ Cleared {count} monitor(s). Your watchlist is now empty."
+    return "Your watchlist was already empty."
     """Return a formatted list of what's being monitored for a user."""
     watches = _user_watchlists.get(chat_id, [])
     if not watches:
@@ -108,21 +119,53 @@ def list_user_monitors(chat_id: int) -> str:
     return "\n".join(lines)
 
 
-def _is_cooled_down(key: str) -> bool:
+# Alert dedup — cooldowns per event type
+SWEEP_COOLDOWN = int(os.environ.get("SWEEP_COOLDOWN", "3600"))   # 1 hour
+BOS_COOLDOWN   = int(os.environ.get("BOS_COOLDOWN",   "14400"))  # 4 hours — a BOS doesn't expire
+CRIME_COOLDOWN = int(os.environ.get("CRIME_COOLDOWN", "1800"))   # 30 min for crime moves
+
+def _is_cooled_down(key: str, cooldown: int = None) -> bool:
+    """Check if enough time has passed since last alert for this key."""
+    if cooldown is None:
+        cooldown = ALERT_COOLDOWN
     last = _alert_cooldowns.get(key, 0)
-    return time.time() - last > ALERT_COOLDOWN
+    return time.time() - last > cooldown
 
 
 def _mark_alerted(key: str):
     _alert_cooldowns[key] = time.time()
 
 
-def _send_alert(text: str):
+def _persist_state():
+    """Save cooldowns + watchlists to 0G Storage. Fire-and-forget."""
+    try:
+        from app.zg_storage import save_state
+        save_state({
+            "cooldowns":  _alert_cooldowns,
+            "watchlists": {str(k): v for k, v in _user_watchlists.items()},
+        })
+    except Exception as e:
+        log.debug(f"scanner: _persist_state failed — {e}")
+
+
+def _send_alert(text: str, alert_type: str = "alert", symbol: str = ""):
     if _send_fn and _chat_id:
         try:
             _send_fn(_chat_id, text)
         except Exception as e:
             log.error(f"scanner: alert send failed — {e}")
+
+    # ── Log to 0G Storage (decentralized intelligence history) ───────────
+    try:
+        from app.zg_storage import append_alert_log
+        append_alert_log({
+            "type":    alert_type,
+            "symbol":  symbol,
+            "message": text[:500],
+            "ts":      datetime.now(timezone.utc).isoformat(),
+        })
+    except Exception:
+        pass
 
 
 def _explain_crime(crime: dict) -> str:
@@ -189,7 +232,7 @@ def run_mexc_crime_scan():
     """Scan MEXC for suspicious moves and alert if found."""
     log.info("scanner: running MEXC crime scan...")
     try:
-        from app.mexc_data import scan_for_crimes
+        from app.mexc_data import scan_for_crimes, get_funding_rate
         crimes = scan_for_crimes(top_n=5)
         if not crimes:
             log.info("scanner: MEXC scan clean — no crimes detected")
@@ -199,15 +242,42 @@ def run_mexc_crime_scan():
             sym   = crime["symbol"]
             chg   = crime["change_pct"]
             score = crime["crime_score"]
-            key   = f"crime_{sym}_{int(abs(chg) / 10)}"  # dedup by symbol + magnitude bucket
+            key   = f"crime_{sym}_{int(abs(chg) / 10)}"
 
-            if not _is_cooled_down(key):
+            if not _is_cooled_down(key, CRIME_COOLDOWN):
                 continue
 
             direction = crime["direction"]
             severity  = crime["severity"]
             rvol      = crime["rvol"]
             rng       = crime["range_pct"]
+
+            # ── MEXC funding rate — critical context for crime assessment ──
+            # Positive funding on a pump = longs paying heavily = reversal risk
+            # Negative funding on a dump = shorts paying = potential squeeze
+            # This is the data Binance can't give us for MEXC-only pairs
+            funding_line = ""
+            try:
+                fd = get_funding_rate(sym)
+                if fd.get("ok"):
+                    rate     = fd["funding_rate"]
+                    rate_pct = f"{rate * 100:+.4f}%"
+                    next_ms  = fd.get("next_settle_time", 0)
+                    now_ms   = int(time.time() * 1000)
+                    mins     = max(0, (next_ms - now_ms) // 60000) if next_ms else 999
+
+                    if direction == "PUMP" and rate > 0.001:
+                        funding_line = f"⚠️ Funding: {rate_pct} (longs paying — reversal risk at settlement in {mins}min)"
+                    elif direction == "PUMP" and rate < -0.0005:
+                        funding_line = f"🔥 Funding: {rate_pct} (shorts paying — fuel for continuation, settle {mins}min)"
+                    elif direction == "DUMP" and rate < -0.001:
+                        funding_line = f"⚠️ Funding: {rate_pct} (shorts paying — squeeze risk at settlement in {mins}min)"
+                    elif direction == "DUMP" and rate > 0.0005:
+                        funding_line = f"🔥 Funding: {rate_pct} (longs paying — fuel for dump, settle {mins}min)"
+                    else:
+                        funding_line = f"Funding: {rate_pct} (settle {mins}min)"
+            except Exception as _fe:
+                log.debug(f"funding fetch failed for {sym}: {_fe}")
 
             explanation = _explain_crime(crime)
 
@@ -220,15 +290,15 @@ def run_mexc_crime_scan():
                 f"Daily range: {rng:.1f}%",
                 f"Crime score: {score:.0f}",
             ]
+            if funding_line:
+                msg_lines.append(funding_line)
             if explanation:
-                msg_lines += ["", "Scout's read:", explanation]
-            msg_lines += [
-                "",
-                f"Scanned at {datetime.now(timezone.utc).strftime('%H:%M UTC')}",
-            ]
+                msg_lines += ["", explanation]
+            msg_lines.append(f"\n{datetime.now(timezone.utc).strftime('%H:%M UTC')}")
 
-            _send_alert("\n".join(msg_lines))
+            _send_alert("\n".join(msg_lines), alert_type="crime", symbol=sym)
             _mark_alerted(key)
+            _persist_state()
             log.info(f"scanner: crime alert sent for {sym} ({chg:+.1f}%)")
 
     except Exception as e:
@@ -259,13 +329,16 @@ def run_structure_scan():
 
                 # ── Alert on fresh sweep (within last 3 H1 candles) ──────
                 if sweep and sweep.get("age_candles", 99) <= 3:
-                    key = f"sweep_{symbol}_{round(sweep['level'], 2)}"
-                    if _is_cooled_down(key):
-                        explanation = _explain_sweep(symbol, sweep, snap["bias_data"])
-                        sym_short = symbol.replace("USDT", "")
+                    sweep_time = sweep.get("open_time", "")[:16]
+                    key = f"sweep_{symbol}_{round(sweep['level'], 2)}_{sweep_time}"
+                    if _is_cooled_down(key, SWEEP_COOLDOWN):
+                        explanation  = _explain_sweep(symbol, sweep, snap["bias_data"])
+                        displacement = snap.get("displacement", {})
+                        order_block  = snap.get("order_block", {})
+                        sym_short    = symbol.replace("USDT", "")
 
                         indu_lines = []
-                        for z in inducements[:2]:
+                        for z in snap.get("inducement_zones", [])[:2]:
                             indu_lines.append(
                                 f"  • {z['price']:.4f}  ({z['distance_pct']:+.1f}%)  — {z['note']}"
                             )
@@ -275,23 +348,35 @@ def run_structure_scan():
                             f"",
                             f"{sweep['description']}",
                             f"HTF Bias: {bias.upper()}",
-                            f"Depth: {sweep['depth_pct']:.2f}%",
+                            f"Depth: {sweep['depth_pct']:.2f}%  ATR: {sweep['depth_atr']:.1f}×",
                         ]
+
+                        if displacement.get("confirmed"):
+                            msg_lines.append(f"✅ {displacement['description']}")
+                            if order_block.get("found"):
+                                msg_lines.append(
+                                    f"📦 OB: {order_block['low']:.4f}–{order_block['high']:.4f}"
+                                )
+                        else:
+                            msg_lines.append(f"⚠️ {displacement.get('description', 'Displacement not confirmed')}")
+
                         if indu_lines:
-                            msg_lines += ["", "Inducement zones ahead:"] + indu_lines
+                            msg_lines += ["", "Inducement zones:"] + indu_lines
                         if explanation:
-                            msg_lines += ["", "Scout's read:", explanation]
+                            msg_lines += ["", explanation]
                         msg_lines.append(f"\n{datetime.now(timezone.utc).strftime('%H:%M UTC')}")
 
-                        _send_alert("\n".join(msg_lines))
+                        _send_alert("\n".join(msg_lines), alert_type="sweep", symbol=symbol)
                         _mark_alerted(key)
+                        _persist_state()
                         log.info(f"scanner: sweep alert sent for {symbol}")
 
                 # ── Alert on fresh BOS (within last 5 H1 candles) ────────
                 if bos.get("broken") and bos.get("candle_idx", 0) >= len(candles_h1) - 5:
                     bos_bias = bos.get("bias", "")
-                    key = f"bos_{symbol}_{round(bos.get('level', 0), 2)}_{bos_bias}"
-                    if _is_cooled_down(key):
+                    bos_time = bos.get("open_time", "")[:16]
+                    key = f"bos_{symbol}_{round(bos.get('level', 0), 2)}_{bos_bias}_{bos_time}"
+                    if _is_cooled_down(key, BOS_COOLDOWN):
                         sym_short = symbol.replace("USDT", "")
                         msg_lines = [
                             f"⚡ BREAK OF STRUCTURE — {sym_short}",
@@ -307,8 +392,9 @@ def run_structure_scan():
                                 f"({next_zone['distance_pct']:+.1f}%)"
                             )
                         msg_lines.append(f"\n{datetime.now(timezone.utc).strftime('%H:%M UTC')}")
-                        _send_alert("\n".join(msg_lines))
+                        _send_alert("\n".join(msg_lines), alert_type="bos", symbol=symbol)
                         _mark_alerted(key)
+                        _persist_state()
                         log.info(f"scanner: BOS alert sent for {symbol}")
 
             except Exception as e:
@@ -360,8 +446,9 @@ def _run_user_watchlist_scan():
                     price  = snap.get("current_price", 0)
 
                     if "sweep" in conds and sweep and sweep.get("age_candles", 99) <= 3:
-                        key = f"user_{chat_id}_sweep_{symbol}_{round(sweep['level'], 2)}"
-                        if _is_cooled_down(key):
+                        sweep_time = sweep.get("open_time", "")[:16]
+                        key = f"user_{chat_id}_sweep_{symbol}_{round(sweep['level'], 2)}_{sweep_time}"
+                        if _is_cooled_down(key, SWEEP_COOLDOWN):
                             explanation = _explain_sweep(symbol, sweep, snap["bias_data"])
                             sym_short = symbol.replace("USDT", "")
                             msg_lines = [
@@ -384,8 +471,9 @@ def _run_user_watchlist_scan():
 
                     if "bos" in conds and bos.get("broken") and bos.get("candle_idx", 0) >= len(candles_h1) - 5:
                         bos_bias = bos.get("bias", "")
-                        key = f"user_{chat_id}_bos_{symbol}_{round(bos.get('level',0),2)}_{bos_bias}"
-                        if _is_cooled_down(key):
+                        bos_time = bos.get("open_time", "")[:16]
+                        key = f"user_{chat_id}_bos_{symbol}_{round(bos.get('level',0),2)}_{bos_bias}_{bos_time}"
+                        if _is_cooled_down(key, BOS_COOLDOWN):
                             sym_short = symbol.replace("USDT", "")
                             msg_lines = [
                                 f"⚡ <b>YOUR WATCHLIST ALERT — {sym_short}</b>",
@@ -413,14 +501,33 @@ def _run_user_watchlist_scan():
 def start_scanner(send_fn, chat_id: int):
     """
     Start the background scanner threads.
-    send_fn: function(chat_id, text) — telegram_bot.send_message
-    chat_id: the Telegram chat ID to send alerts to
+    Restores prior state from 0G Storage on startup.
     """
-    global _send_fn, _chat_id, _running
+    global _send_fn, _chat_id, _running, _alert_cooldowns, _user_watchlists
+
     _send_fn = send_fn
     _chat_id = chat_id
-    _running = True
 
+    # ── Restore state from 0G Storage ────────────────────────────────────
+    # This is what makes Scout's memory survive restarts and deploys.
+    # Cooldowns, watchlists, and alert history are all persisted on 0G.
+    try:
+        from app.zg_storage import load_state
+        prior = load_state()
+        if prior:
+            _alert_cooldowns  = prior.get("cooldowns",   {})
+            _user_watchlists  = prior.get("watchlists",  {})
+            log.info(
+                f"scanner: restored from 0G Storage — "
+                f"{len(_alert_cooldowns)} cooldowns, "
+                f"{sum(len(v) for v in _user_watchlists.values())} user monitors"
+            )
+        else:
+            log.info("scanner: no prior 0G Storage state — starting fresh")
+    except Exception as e:
+        log.warning(f"scanner: state restore failed — {e} — starting fresh")
+
+    _running = True
     t1 = threading.Thread(target=_mexc_loop,      daemon=True, name="mexc-scanner")
     t2 = threading.Thread(target=_structure_loop, daemon=True, name="structure-scanner")
     t1.start()

@@ -20,7 +20,35 @@ CRIME_RVOL_THRESHOLD  = 2.0    # 2x normal volume
 CRIME_RANGE_THRESHOLD = 8.0    # 8%+ daily range
 
 
-def get_all_tickers() -> list:
+def get_funding_rate(symbol: str) -> dict:
+    """
+    Fetch current funding rate from MEXC contract API.
+    Symbol format: BTC_USDT (MEXC uses underscores)
+    Endpoint: GET /api/v1/contract/funding_rate/{symbol}
+
+    Returns {funding_rate, next_settle_time (ms), ok}
+    Identical to BEEM's data.py get_funding_rate().
+    """
+    # Normalise: BTCUSDT → BTC_USDT
+    if "_" not in symbol:
+        sym = symbol.replace("USDT", "_USDT")
+    else:
+        sym = symbol
+    try:
+        r = requests.get(f"{BASE}/funding_rate/{sym}", timeout=8)
+        r.raise_for_status()
+        d = r.json()
+        if not d.get("success"):
+            return {"funding_rate": 0.0, "next_settle_time": 0, "ok": False}
+        data = d.get("data", {})
+        return {
+            "funding_rate":     float(data.get("fundingRate", 0)),
+            "next_settle_time": int(data.get("nextSettleTime", 0)),
+            "ok":               True,
+        }
+    except Exception as e:
+        log.debug(f"MEXC get_funding_rate {sym}: {e}")
+        return {"funding_rate": 0.0, "next_settle_time": 0, "ok": False}
     """
     Pull the full MEXC futures ticker feed — all USDT perpetuals.
     Returns a list of dicts with symbol, price, change_pct, volume etc.

@@ -118,7 +118,9 @@ def handle_update(update: dict) -> None:
             "/scan — run structure scan now\n"
             "/movers — top MEXC gainers/losers\n"
             "/watchlist — see your monitors\n"
-            "/bias SOL — HTF bias + structure for a symbol\n\n"
+            "/clearwatchlist — stop all monitors\n"
+            "/bias SOL — HTF bias + structure for a symbol\n"
+            "/funding BTC — funding rate intelligence\n\n"
             "<b>Or just talk naturally:</b>\n"
             "• <i>Monitor BTC on 1H for sweeps</i>\n"
             "• <i>Watch ETH 4H for BOS — looking for bearish setup</i>\n"
@@ -146,9 +148,43 @@ def handle_update(update: dict) -> None:
         return
 
     if text.startswith("/crimes"):
-        send_message(chat_id, "🔍 Scanning MEXC for coordinated moves (5%+)...")
-        from app.scanner import run_mexc_crime_scan
-        run_mexc_crime_scan()
+        from app.mexc_data import get_top_movers
+        send_message(chat_id, "🔍 Fetching MEXC top movers...")
+        movers = get_top_movers(top_n=20)
+        if not movers["gainers"] and not movers["losers"]:
+            send_message(chat_id, "⚠️ Could not reach MEXC API right now. Try again in a moment.")
+            return
+
+        gain_lines = ["📈 <b>TOP 20 GAINERS</b>\n"]
+        for i, m in enumerate(movers["gainers"], 1):
+            sym  = m["symbol"].replace("_USDT", "")
+            chg  = m["change_pct"]
+            vol  = m.get("volume_24h", 0)
+            flag = "🚨" if abs(chg) > 30 else "⚠️" if abs(chg) > 15 else "📈"
+            gain_lines.append(f"{flag} {i}. <b>{sym}</b>  {chg:+.1f}%  vol:{vol:,.0f}")
+
+        loss_lines = ["\n📉 <b>TOP 20 LOSERS</b>\n"]
+        for i, m in enumerate(movers["losers"], 1):
+            sym  = m["symbol"].replace("_USDT", "")
+            chg  = m["change_pct"]
+            vol  = m.get("volume_24h", 0)
+            flag = "🚨" if abs(chg) > 30 else "⚠️" if abs(chg) > 15 else "📉"
+            loss_lines.append(f"{flag} {i}. <b>{sym}</b>  {chg:+.1f}%  vol:{vol:,.0f}")
+
+        send_message(chat_id, "\n".join(gain_lines))
+        send_message(chat_id, "\n".join(loss_lines))
+
+        # Ask 0G to explain the most extreme mover
+        extreme = max(
+            movers["gainers"][:1] + movers["losers"][:1],
+            key=lambda x: abs(x["change_pct"]),
+            default=None
+        )
+        if extreme:
+            from app.reasoning import explain_crime_move
+            commentary = explain_crime_move(extreme)
+            if commentary:
+                send_message(chat_id, f"🤖 <b>Scout's read on the biggest mover:</b>\n\n{commentary}")
         return
 
     if text.startswith("/scan"):
@@ -173,6 +209,78 @@ def handle_update(update: dict) -> None:
     if text.startswith("/watchlist"):
         from app.scanner import list_user_monitors
         send_message(chat_id, list_user_monitors(chat_id))
+        return
+
+    if text.startswith("/clearwatchlist") or text.lower() in (
+        "clear watchlist", "reset watchlist", "clear my watchlist",
+        "reset monitors", "clear monitors", "stop all monitors",
+        "remove all monitors", "clear all", "stop monitoring everything",
+    ):
+        from app.scanner import clear_all_monitors
+        send_message(chat_id, clear_all_monitors(chat_id))
+        return
+
+    if text.startswith("/history"):
+        send_message(chat_id, "Fetching your alert history from 0G Storage...")
+        try:
+            from app.zg_storage import load_pointer, download
+            root = load_pointer()
+            if not root:
+                send_message(chat_id, "No history found yet — Scout will build it as alerts fire.")
+                return
+            state = download(root)
+            log_entries = (state or {}).get("alert_log", [])
+            if not log_entries:
+                send_message(chat_id, "No alerts logged yet.")
+                return
+            recent = log_entries[-10:]
+            lines  = ["<b>Last 10 Scout Alerts (from 0G Storage)</b>\n"]
+            for e in reversed(recent):
+                ts  = e.get("ts", "")[:16].replace("T", " ")
+                typ = e.get("type", "").upper()
+                sym = e.get("symbol", "").replace("_USDT", "").replace("USDT", "")
+                lines.append(f"<b>{ts}</b>  {typ}  {sym}")
+            send_message(chat_id, "\n".join(lines))
+        except Exception as e:
+            send_message(chat_id, f"⚠️ History unavailable: {e}")
+        return
+
+    if text.lower().startswith("/funding"):
+        parts  = text.split()
+        raw    = parts[1].upper() if len(parts) > 1 else "BTC"
+        # Normalise: strip any existing USDT suffix, then re-add
+        symbol = raw.replace("_USDT", "").replace("USDT", "") + "USDT"
+        from app.market_data import get_funding_intelligence
+        f = get_funding_intelligence(symbol)
+        if f.get("error"):
+            # Try fetching directly from MEXC as last resort
+            try:
+                from app.mexc_data import get_funding_rate
+                fd = get_funding_rate(symbol)
+                if fd.get("ok"):
+                    rate = fd["funding_rate"]
+                    next_ms = fd.get("next_settle_time", 0)
+                    now_ms  = int(__import__("time").time() * 1000)
+                    mins    = max(0, (next_ms - now_ms) // 60000) if next_ms else 999
+                    send_message(chat_id,
+                        f"<b>Funding Rate — {symbol} (MEXC)</b>\n\n"
+                        f"Rate: {rate * 100:+.4f}%\n"
+                        f"Settlement in: {mins}min\n"
+                        f"{'Longs pay shorts' if rate > 0 else 'Shorts pay longs' if rate < 0 else 'Neutral'}"
+                    )
+                else:
+                    send_message(chat_id, f"⚠️ No funding data found for {symbol} on MEXC or Binance.")
+            except Exception as _fe:
+                send_message(chat_id, f"⚠️ Funding unavailable for {symbol}: {f['error']}")
+        else:
+            warn = (
+                "\n\n🚨 <b>SETTLEMENT WARNING</b>\n"
+                "Funding settles in under 30 minutes. Avoid new entries — "
+                "expect a volatility spike at settlement."
+            ) if f.get("settlement_warning") else ""
+            send_message(chat_id,
+                f"<b>Funding Rate — {symbol}</b>\n\n{f['read']}{warn}"
+            )
         return
 
     if text.lower().startswith("/bias"):
@@ -221,6 +329,7 @@ def run_polling_loop() -> None:
     from app import scanner
     log.info("Scout: starting Telegram polling loop")
     offset = 0
+    last_heartbeat = time.time()
 
     while True:
         try:
@@ -243,6 +352,12 @@ def run_polling_loop() -> None:
                         )
                 except Exception as e:
                     log.error(f"handle_update error: {e}")
+
+            # Heartbeat every 5 minutes so Railway logs show it's alive
+            now = time.time()
+            if now - last_heartbeat > 300:
+                log.info("Scout: polling alive ✓")
+                last_heartbeat = now
 
         except requests.exceptions.RequestException as e:
             log.warning(f"polling error (will retry): {e}")

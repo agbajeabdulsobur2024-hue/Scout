@@ -82,6 +82,360 @@ def get_funding_rate(symbol: str) -> dict:
     }
 
 
+def get_funding_intelligence(symbol: str, bias: str = "neutral") -> dict:
+    """
+    Full funding rate picture using BEEM's funding_intelligence.py thresholds:
+
+    BEEM thresholds (from funding_intelligence.py):
+      FUNDING_HIGH_POSITIVE =  0.001  (0.1%) — longs pay, avoid entering long
+      FUNDING_HIGH_NEGATIVE = -0.001  (-0.1%) — longs receive, carry trade
+      FUNDING_EXTREME       =  0.003  (0.3%) — extreme, halve position size
+      SETTLEMENT_WARN_MINS  =  30     — warn if within 30 min
+      SETTLEMENT_AVOID_MINS =  5      — avoid new entries within 5 min
+
+    MEXC/Binance settlement intervals:
+      Default: 8h (00:00, 08:00, 16:00 UTC)
+      Some pairs: 4h, 2h, or 1h intervals
+      The actual next_funding_time from the API tells us the real interval.
+    """
+    # BEEM thresholds
+    FUNDING_HIGH_POSITIVE  = 0.001
+    FUNDING_HIGH_NEGATIVE  = -0.001
+    FUNDING_EXTREME        = 0.003
+    SETTLEMENT_WARN_MINS   = 30
+    SETTLEMENT_AVOID_MINS  = 5
+
+    result = {
+        "symbol":             symbol,
+        "rate":               None,
+        "rate_pct":           None,
+        "direction":          None,
+        "carry_signal":       None,
+        "position_cost":      None,
+        "bias_alignment":     None,
+        "signal":             None,
+        "hold_signal":        None,
+        "size_mult":          1.0,
+        "mins_to_settlement": None,
+        "next_settlement_utc": None,
+        "interval_hours":     8.0,
+        "settlement_warning": False,
+        "avoid_entry":        False,
+        "read":               "",
+        "error":              None,
+    }
+
+    try:
+        from datetime import datetime, timezone
+        import time as _time
+
+        # ── Fetch: MEXC first, Binance as fallback ────────────────────────
+        # MEXC is the primary exchange for BEEM's pairs. Binance fallback
+        # covers majors that may not be on MEXC or where MEXC API is slow.
+        raw_rate       = None
+        next_funding_ms = 0
+        source         = "unknown"
+
+        try:
+            from app.mexc_data import get_funding_rate as mexc_funding
+            mexc = mexc_funding(symbol)
+            if mexc.get("ok"):
+                raw_rate        = mexc["funding_rate"]
+                next_funding_ms = mexc["next_settle_time"]
+                source          = "MEXC"
+        except Exception:
+            pass
+
+        if raw_rate is None:
+            # Binance fallback
+            resp = requests.get(
+                f"{FAPI_BASE}/premiumIndex",
+                params={"symbol": symbol},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            d               = resp.json()
+            raw_rate        = float(d["lastFundingRate"])
+            next_funding_ms = int(d.get("nextFundingTime", 0))
+            source          = "Binance"
+
+        rate       = raw_rate
+        now_ms     = int(_time.time() * 1000)
+        mins_to_settle = max(0, (next_funding_ms - now_ms) // 60000) if next_funding_ms else 999
+
+        # Detect actual settlement interval from next funding time
+        if mins_to_settle <= 62:
+            interval_hours = 1.0
+        elif mins_to_settle <= 125:
+            interval_hours = 2.0
+        elif mins_to_settle <= 245:
+            interval_hours = 4.0
+        else:
+            interval_hours = 8.0
+
+        next_settle_str = (
+            datetime.fromtimestamp(next_funding_ms / 1000, tz=timezone.utc).strftime("%H:%M UTC")
+            if next_funding_ms else "unknown"
+        )
+
+        settlement_warning = mins_to_settle <= SETTLEMENT_WARN_MINS and abs(rate) > 0.0002
+        avoid_entry        = mins_to_settle <= SETTLEMENT_AVOID_MINS
+
+        result.update({
+            "rate":               rate,
+            "rate_pct":           f"{rate * 100:+.4f}%",
+            "mark_price":         mark_price,
+            "mins_to_settlement": mins_to_settle,
+            "next_settlement_utc": next_settle_str,
+            "interval_hours":     interval_hours,
+            "settlement_warning": settlement_warning,
+            "avoid_entry":        avoid_entry,
+        })
+
+        # ── Rate direction ──────────────────────────────────────────────
+        if rate > 0.0001:
+            result["direction"]    = "POSITIVE"
+            result["position_cost"] = "LONGS_PAY"
+        elif rate < -0.0001:
+            result["direction"]    = "NEGATIVE"
+            result["position_cost"] = "SHORTS_PAY"
+        else:
+            result["direction"]    = "NEUTRAL"
+            result["position_cost"] = "NEUTRAL"
+
+        # ── Carry signal (BEEM logic) ───────────────────────────────────
+        is_long = bias == "bullish"
+        if rate < -0.0001:
+            # Negative: longs receive carry
+            result["carry_signal"]  = "FAVORABLE" if is_long else "UNFAVORABLE"
+        elif rate > 0.0001:
+            # Positive: longs pay, shorts receive
+            result["carry_signal"]  = "UNFAVORABLE" if is_long else "FAVORABLE"
+        else:
+            result["carry_signal"]  = "NEUTRAL"
+
+        # ── Bias alignment (BEEM thresholds) ───────────────────────────
+        abs_rate = abs(rate)
+        if bias == "bullish":
+            if rate > FUNDING_HIGH_POSITIVE:
+                result["bias_alignment"] = "against"  # longs paying high rate
+            elif rate < FUNDING_HIGH_NEGATIVE:
+                result["bias_alignment"] = "for"      # longs getting paid
+            else:
+                result["bias_alignment"] = "neutral"
+        elif bias == "bearish":
+            if rate > FUNDING_HIGH_POSITIVE:
+                result["bias_alignment"] = "for"      # shorts getting paid
+            elif rate < FUNDING_HIGH_NEGATIVE:
+                result["bias_alignment"] = "against"  # shorts paying
+            else:
+                result["bias_alignment"] = "neutral"
+        else:
+            result["bias_alignment"] = "neutral"
+
+        # ── Size multiplier (BEEM logic) ────────────────────────────────
+        size_mult = 1.0
+        if result["carry_signal"] == "FAVORABLE":
+            if abs_rate >= abs(FUNDING_HIGH_NEGATIVE):
+                size_mult = 1.15  # 15% boost — strong carry, hold longer
+            elif abs_rate >= 0.0003:
+                size_mult = 1.05
+        elif result["carry_signal"] == "UNFAVORABLE":
+            if abs_rate >= FUNDING_EXTREME:
+                size_mult = 0.5   # halve size — extreme adverse funding
+            elif abs_rate >= FUNDING_HIGH_POSITIVE:
+                size_mult = 0.75  # reduce 25%
+            else:
+                size_mult = 0.9
+        result["size_mult"] = round(size_mult, 3)
+
+        # ── Hold signal (BEEM logic) ────────────────────────────────────
+        if settlement_warning and result["carry_signal"] == "FAVORABLE" and abs_rate >= 0.0003:
+            result["hold_signal"] = "HOLD_FOR_CARRY"
+        elif settlement_warning and result["carry_signal"] == "UNFAVORABLE" and abs_rate >= FUNDING_HIGH_POSITIVE:
+            result["hold_signal"] = "EXIT_BEFORE_SETTLE"
+        else:
+            result["hold_signal"] = "NEUTRAL"
+
+        # ── Overall signal (BEEM logic) ─────────────────────────────────
+        if avoid_entry:
+            result["signal"] = "AVOID"
+            note = f"⛔ Too close to settlement ({mins_to_settle}min) — wait"
+        elif result["carry_signal"] == "FAVORABLE" and abs_rate >= abs(FUNDING_HIGH_NEGATIVE):
+            result["signal"] = "POSITIVE_CARRY"
+            payer = "longs" if is_long else "shorts"
+            note = f"✅ Funding {result['rate_pct']} — {payer} receive carry"
+        elif result["carry_signal"] == "UNFAVORABLE" and abs_rate >= FUNDING_EXTREME:
+            result["signal"] = "AVOID"
+            payer = "longs" if is_long else "shorts"
+            note = f"⛔ Funding {result['rate_pct']} — extreme adverse carry ({payer} pay)"
+        elif result["carry_signal"] == "UNFAVORABLE" and abs_rate >= FUNDING_HIGH_POSITIVE:
+            result["signal"] = "NEGATIVE_CARRY"
+            payer = "longs" if is_long else "shorts"
+            note = f"⚠️ Funding {result['rate_pct']} — {payer} pay"
+        else:
+            result["signal"] = "NEUTRAL"
+            note = f"➖ Funding {result['rate_pct']} — neutral carry"
+
+        result["note"] = note
+
+        # ── Human-readable summary ──────────────────────────────────────
+        align_str = {
+            "for":     "✅ WITH bias",
+            "against": "⚠️ AGAINST bias",
+            "neutral": "➖ neutral",
+        }.get(result["bias_alignment"], "➖")
+
+        hold_str = ""
+        if result["hold_signal"] == "HOLD_FOR_CARRY":
+            hold_str = "\n💰 HOLD FOR CARRY — getting paid at settlement"
+        elif result["hold_signal"] == "EXIT_BEFORE_SETTLE":
+            hold_str = "\n⛔ EXIT BEFORE SETTLE — you're about to pay"
+
+        warn_str = ""
+        if settlement_warning:
+            warn_str = f"\n🚨 Settlement in {mins_to_settle}min — avoid new entries"
+        elif avoid_entry:
+            warn_str = f"\n⛔ Settlement in {mins_to_settle}min — DO NOT enter"
+
+        result["read"] = (
+            f"Rate: {result['rate_pct']}  ({result['position_cost'].replace('_', ' ').title()})\n"
+            f"Alignment: {align_str}\n"
+            f"Settlement: {mins_to_settle}min  ({next_settle_str})  [every {interval_hours:.0f}h]\n"
+            f"Size: {size_mult:.0%} of normal  |  Source: {source}"
+            f"{hold_str}{warn_str}"
+        )
+
+    except Exception as e:
+        result["error"] = str(e)
+        result["read"]  = f"Funding data unavailable: {e}"
+
+    return result
+    """
+    Full funding rate picture for a symbol:
+    - Current rate and direction
+    - Whether it's FOR or AGAINST the current trade bias
+    - Next settlement time and minutes until settlement
+    - Warning if trading within 30 minutes of settlement
+    - Historical context (is this rate extreme?)
+
+    Binance perpetuals settle every 8 hours: 00:00, 08:00, 16:00 UTC.
+    At settlement, longs pay shorts (positive rate) or shorts pay longs (negative rate).
+    This creates price pressure near settlement — knowing where you are in the cycle matters.
+    """
+    from datetime import datetime, timezone, timedelta
+
+    result = {
+        "symbol":              symbol,
+        "funding_rate":        None,
+        "rate_pct":            None,
+        "rate_direction":      None,  # "longs_pay" | "shorts_pay"
+        "bias_alignment":      None,  # "for" | "against" | "neutral"
+        "settlement_warning":  False,
+        "mins_to_settlement":  None,
+        "next_settlement_utc": None,
+        "read":                "",
+        "error":               None,
+    }
+
+    try:
+        # ── Fetch current funding rate ────────────────────────────────────
+        resp = requests.get(
+            f"{FAPI_BASE}/premiumIndex",
+            params={"symbol": symbol},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        d = resp.json()
+        rate       = float(d["lastFundingRate"])
+        mark_price = float(d["markPrice"])
+
+        result["funding_rate"] = rate
+        result["rate_pct"]     = round(rate * 100, 4)
+        result["mark_price"]   = mark_price
+
+        # ── Rate direction ────────────────────────────────────────────────
+        if rate > 0:
+            result["rate_direction"] = "longs_pay"   # bullish crowd is overloaded
+        elif rate < 0:
+            result["rate_direction"] = "shorts_pay"  # bearish crowd is overloaded
+        else:
+            result["rate_direction"] = "neutral"
+
+        # ── Bias alignment ────────────────────────────────────────────────
+        # Positive funding (longs pay) = bearish pressure at settlement.
+        # If you're looking to go LONG: positive funding is AGAINST you (you pay, and
+        # price often dumps at settlement as over-leveraged longs get squeezed).
+        # If you're looking to go SHORT: positive funding is FOR you (shorts get paid).
+        if bias == "bullish":
+            if rate > 0.0003:    # more than 0.03% — notable longs paying
+                result["bias_alignment"] = "against"
+            elif rate < -0.0001: # shorts paying — fuel for long
+                result["bias_alignment"] = "for"
+            else:
+                result["bias_alignment"] = "neutral"
+        elif bias == "bearish":
+            if rate > 0.0003:    # longs paying — fuel for short
+                result["bias_alignment"] = "for"
+            elif rate < -0.0001: # shorts paying — risky to be short
+                result["bias_alignment"] = "against"
+            else:
+                result["bias_alignment"] = "neutral"
+        else:
+            result["bias_alignment"] = "neutral"
+
+        # ── Settlement timing ─────────────────────────────────────────────
+        # Binance funding settles at 00:00, 08:00, 16:00 UTC every day.
+        now_utc   = datetime.now(timezone.utc)
+        hour      = now_utc.hour
+        # Find next settlement hour
+        settlements = [0, 8, 16]
+        next_hour   = next((h for h in settlements if h > hour), settlements[0])
+        if next_hour <= hour:  # wraps to next day
+            next_settlement = now_utc.replace(
+                hour=next_hour, minute=0, second=0, microsecond=0
+            ) + timedelta(days=1)
+        else:
+            next_settlement = now_utc.replace(
+                hour=next_hour, minute=0, second=0, microsecond=0
+            )
+        mins_to_settlement = int((next_settlement - now_utc).total_seconds() / 60)
+
+        result["mins_to_settlement"]  = mins_to_settlement
+        result["next_settlement_utc"] = next_settlement.strftime("%H:%M UTC")
+
+        # ── Settlement warning ────────────────────────────────────────────
+        # Trading within 30 min of settlement with an extreme rate is high risk.
+        # At settlement, over-leveraged positions get unwound — price can spike
+        # sharply then reverse. Most experienced traders avoid entries here.
+        if mins_to_settlement <= 30 and abs(rate) > 0.0002:
+            result["settlement_warning"] = True
+
+        # ── Human-readable summary ────────────────────────────────────────
+        rate_str   = f"{rate * 100:+.4f}%"
+        payer      = "Longs pay shorts" if rate > 0 else "Shorts pay longs"
+        align_str  = {
+            "for":     "✅ WITH your bias",
+            "against": "⚠️ AGAINST your bias",
+            "neutral": "— neutral",
+        }.get(result["bias_alignment"], "—")
+
+        settlement_str = f"{mins_to_settlement}min to next settlement ({result['next_settlement_utc']})"
+        warning_str    = " ⚠️ NEAR SETTLEMENT — avoid new entries" if result["settlement_warning"] else ""
+
+        result["read"] = (
+            f"Funding: {rate_str}  ({payer})\n"
+            f"Alignment: {align_str}\n"
+            f"Settlement: {settlement_str}{warning_str}"
+        )
+
+    except Exception as e:
+        result["error"] = str(e)
+        result["read"]  = f"Funding data unavailable: {e}"
+
+    return result
+
+
 def _range_position(candles: list) -> float:
     """Where is price sitting within its recent high/low range? 0 = at low, 1 = at high."""
     if not candles:
