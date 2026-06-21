@@ -43,12 +43,16 @@ _running = False
 _user_watchlists: dict = {}
 
 
-def add_user_monitor(chat_id: int, symbol: str, tf: str = "1h",
-                     conditions: list = None, note: str = "") -> str:
+def add_user_monitor(chat_id: int, symbol: str, tf: str = "15m",
+                     conditions: list = None, note: str = "",
+                     entry_tf: str = "15m", confirm_tf: str = "1h",
+                     bias_tf: str = "4h") -> str:
     """
-    Register a symbol for a user's personal watchlist.
-    The scanner will check this symbol on every structure scan and alert
-    that specific user when conditions are met.
+    Register a symbol for a user's personal watchlist with their own TF stack.
+    Defaults to the core SMC strategy TFs if not specified:
+      entry_tf   = M15 (sweep + displacement)
+      confirm_tf = H1  (BOS confirmation)
+      bias_tf    = H4  (HTF bias)
     """
     symbol = symbol.upper()
     if not symbol.endswith("USDT"):
@@ -56,14 +60,15 @@ def add_user_monitor(chat_id: int, symbol: str, tf: str = "1h",
 
     entry = {
         "symbol":     symbol,
-        "tf":         tf,
         "conditions": conditions or ["sweep", "bos"],
         "note":       note,
+        "entry_tf":   entry_tf,
+        "confirm_tf": confirm_tf,
+        "bias_tf":    bias_tf,
     }
     if chat_id not in _user_watchlists:
         _user_watchlists[chat_id] = []
 
-    # Don't add duplicates
     existing = [w["symbol"] for w in _user_watchlists[chat_id]]
     if symbol in existing:
         return f"{symbol} is already on your watchlist."
@@ -71,15 +76,15 @@ def add_user_monitor(chat_id: int, symbol: str, tf: str = "1h",
     _user_watchlists[chat_id].append(entry)
     log.info(f"scanner: {chat_id} added {symbol} to personal watchlist")
 
-    # Persist to 0G Storage so watchlist survives restarts
     import threading
     threading.Thread(target=_persist_state, daemon=True).start()
 
+    tf_desc = f"Entry: {entry_tf.upper()} | Confirm: {confirm_tf.upper()} | Bias: {bias_tf.upper()}"
     return (
-        f"✅ Now monitoring {symbol} on {tf.upper()} for "
-        f"{', '.join(entry['conditions'])}.\n"
-        f"You'll get an alert the moment something happens."
-        + (f"\nNote: {note}" if note else "")
+        f"✅ Now monitoring <b>{symbol}</b>\n"
+        f"TF stack: {tf_desc}\n"
+        f"Watching for: {', '.join(entry['conditions'])}"
+        + (f"\n📌 {note}" if note else "")
     )
 
 
@@ -306,96 +311,97 @@ def run_mexc_crime_scan():
 
 
 def run_structure_scan():
-    """Scan Binance watchlist for sweeps, BOS, and structure breaks."""
-    log.info("scanner: running structure scan...")
+    """
+    Default scan using the core SMC strategy:
+      Daily + H4 → bias
+      H1         → BOS confirmation (setup forming)
+      M15        → sweep + displacement entry signal
+
+    User custom monitors use their own TF stack.
+    """
+    log.info("scanner: running structure scan (M15 entry | H1 confirm | H4+D bias)...")
     try:
         from app.market_data import get_klines
-        from app.structure import full_structure_snapshot
+        from app.structure import (full_structure_snapshot, detect_bos,
+                                    get_htf_bias)
 
         for symbol in STRUCTURE_WATCHLIST:
             try:
+                candles_m15   = get_klines(symbol, "15m", 96)
                 candles_h1    = get_klines(symbol, "1h",  50)
                 candles_h4    = get_klines(symbol, "4h",  50)
                 candles_daily = get_klines(symbol, "1d",  30)
 
-                if not candles_h1:
+                if not candles_m15 or not candles_h1:
                     continue
 
-                snap = full_structure_snapshot(symbol, candles_h1, candles_h4, candles_daily)
-                sweep = snap.get("recent_sweep")
-                bos   = snap.get("bos_h1", {})
-                bias  = snap.get("bias", "neutral")
-                inducements = snap.get("inducement_zones", [])
+                # HTF bias
+                bias_data = get_htf_bias(candles_daily, candles_h4)
+                bias      = bias_data["bias"]
 
-                # ── Alert on fresh sweep (within last 3 H1 candles) ──────
+                # H1 BOS confirmation
+                h1_bos = detect_bos(candles_h1, lookback=48)
+
+                # M15 sweep + displacement (entry signal)
+                snap_m15     = full_structure_snapshot(symbol, candles_m15, candles_h1, candles_h4)
+                sweep        = snap_m15.get("recent_sweep")
+                displacement = snap_m15.get("displacement", {})
+                order_block  = snap_m15.get("order_block", {})
+                inducements  = snap_m15.get("inducement_zones", [])
+                sym_short    = symbol.replace("USDT", "")
+
+                # ── M15 sweep alert ───────────────────────────────────────
                 if sweep and sweep.get("age_candles", 99) <= 3:
                     sweep_time = sweep.get("open_time", "")[:16]
                     key = f"sweep_{symbol}_{round(sweep['level'], 2)}_{sweep_time}"
                     if _is_cooled_down(key, SWEEP_COOLDOWN):
-                        explanation  = _explain_sweep(symbol, sweep, snap["bias_data"])
-                        displacement = snap.get("displacement", {})
-                        order_block  = snap.get("order_block", {})
-                        sym_short    = symbol.replace("USDT", "")
-
-                        indu_lines = []
-                        for z in snap.get("inducement_zones", [])[:2]:
-                            indu_lines.append(
-                                f"  • {z['price']:.4f}  ({z['distance_pct']:+.1f}%)  — {z['note']}"
-                            )
-
+                        explanation = _explain_sweep(symbol, sweep, bias_data)
                         msg_lines = [
-                            f"🎯 LIQUIDITY SWEEP — {sym_short}",
+                            f"🎯 M15 SWEEP — {sym_short}",
                             f"",
                             f"{sweep['description']}",
-                            f"HTF Bias: {bias.upper()}",
-                            f"Depth: {sweep['depth_pct']:.2f}%  ATR: {sweep['depth_atr']:.1f}×",
+                            f"H4 Bias: {bias.upper()}",
+                            f"H1 BOS: {'✅ ' + h1_bos.get('bias','').upper() if h1_bos.get('broken') else '⏳ Not confirmed yet'}",
+                            f"Alignment: {'✅ FULL — all TFs aligned' if h1_bos.get('broken') and h1_bos.get('bias') == bias else '⚠️ Watch H1 for BOS confirmation'}",
                         ]
-
                         if displacement.get("confirmed"):
                             msg_lines.append(f"✅ {displacement['description']}")
                             if order_block.get("found"):
-                                msg_lines.append(
-                                    f"📦 OB: {order_block['low']:.4f}–{order_block['high']:.4f}"
-                                )
+                                msg_lines.append(f"📦 OB: {order_block['low']:.4f}–{order_block['high']:.4f}")
                         else:
-                            msg_lines.append(f"⚠️ {displacement.get('description', 'Displacement not confirmed')}")
-
-                        if indu_lines:
-                            msg_lines += ["", "Inducement zones:"] + indu_lines
+                            msg_lines.append("⚠️ No displacement yet — wait for confirmation")
+                        for z in inducements[:2]:
+                            msg_lines.append(f"  • {z['price']:.4f} ({z['distance_pct']:+.1f}%) — {z['note']}")
                         if explanation:
                             msg_lines += ["", explanation]
                         msg_lines.append(f"\n{datetime.now(timezone.utc).strftime('%H:%M UTC')}")
-
                         _send_alert("\n".join(msg_lines), alert_type="sweep", symbol=symbol)
                         _mark_alerted(key)
                         _persist_state()
-                        log.info(f"scanner: sweep alert sent for {symbol}")
+                        log.info(f"scanner: M15 sweep alert — {symbol}")
 
-                # ── Alert on fresh BOS (within last 5 H1 candles) ────────
-                if bos.get("broken") and bos.get("candle_idx", 0) >= len(candles_h1) - 2:
-                    bos_bias = bos.get("bias", "")
-                    bos_time = bos.get("open_time", "")[:16]
-                    key = f"bos_{symbol}_{round(bos.get('level', 0), 2)}_{bos_bias}_{bos_time}"
+                # ── H1 BOS alert (setup forming, watch M15) ───────────────
+                if h1_bos.get("broken") and h1_bos.get("candle_idx", 0) >= len(candles_h1) - 2:
+                    bos_bias = h1_bos.get("bias", "")
+                    bos_time = h1_bos.get("open_time", "")[:16]
+                    key = f"bos_{symbol}_{round(h1_bos.get('level', 0), 2)}_{bos_bias}_{bos_time}"
                     if _is_cooled_down(key, BOS_COOLDOWN):
-                        sym_short = symbol.replace("USDT", "")
+                        alignment = "✅ WITH H4 bias" if bos_bias == bias else "⚠️ AGAINST H4 bias"
                         msg_lines = [
-                            f"⚡ BREAK OF STRUCTURE — {sym_short}",
+                            f"⚡ H1 BOS — {sym_short}",
                             f"",
-                            f"{bos.get('description', '')}",
-                            f"HTF Bias: {bias.upper()}",
-                            f"Alignment: {'✅ WITH bias' if bos_bias == bias else '⚠️ AGAINST bias'}",
+                            f"{h1_bos.get('description', '')}",
+                            f"H4 Bias: {bias.upper()}  |  {alignment}",
+                            f"👀 Watch M15 for sweep + displacement entry",
                         ]
                         if inducements:
-                            next_zone = inducements[0]
-                            msg_lines.append(
-                                f"Next inducement: {next_zone['price']:.4f} "
-                                f"({next_zone['distance_pct']:+.1f}%)"
-                            )
+                            z = inducements[0]
+                            msg_lines.append(f"Next inducement: {z['price']:.4f} ({z['distance_pct']:+.1f}%)")
                         msg_lines.append(f"\n{datetime.now(timezone.utc).strftime('%H:%M UTC')}")
                         _send_alert("\n".join(msg_lines), alert_type="bos", symbol=symbol)
                         _mark_alerted(key)
                         _persist_state()
-                        log.info(f"scanner: BOS alert sent for {symbol}")
+                        log.info(f"scanner: H1 BOS alert — {symbol}")
 
             except Exception as e:
                 log.debug(f"scanner: structure scan error for {symbol} — {e}")
@@ -421,90 +427,108 @@ def _structure_loop():
 
 
 def _run_user_watchlist_scan():
-    """Scan each user's personal watchlist and alert that specific user."""
+    """Scan each user's personal watchlist using their configured TF stack."""
     if not _user_watchlists:
         return
     try:
         from app.market_data import get_klines
-        from app.structure import full_structure_snapshot
+        from app.structure import full_structure_snapshot, detect_bos, get_htf_bias
 
         for chat_id, watches in _user_watchlists.items():
             for watch in watches:
-                symbol = watch["symbol"]
-                tf     = watch.get("tf", "1h")
-                conds  = watch.get("conditions", ["sweep", "bos"])
-                try:
-                    candles_h1    = get_klines(symbol, tf,   50)
-                    candles_h4    = get_klines(symbol, "4h", 50)
-                    candles_daily = get_klines(symbol, "1d", 30)
-                    snap = full_structure_snapshot(symbol, candles_h1, candles_h4, candles_daily)
+                symbol     = watch["symbol"]
+                conds      = watch.get("conditions", ["sweep", "bos"])
+                entry_tf   = watch.get("entry_tf",   "15m")
+                confirm_tf = watch.get("confirm_tf", "1h")
+                bias_tf    = watch.get("bias_tf",    "4h")
 
-                    bias   = snap.get("bias", "neutral")
-                    sweep  = snap.get("recent_sweep")
-                    bos    = snap.get("bos_h1", {})
-                    indu   = snap.get("inducement_zones", [])
-                    price  = snap.get("current_price", 0)
+                try:
+                    candles_entry   = get_klines(symbol, entry_tf,   96)
+                    candles_confirm = get_klines(symbol, confirm_tf, 50)
+                    candles_bias    = get_klines(symbol, bias_tf,    50)
+                    candles_daily   = get_klines(symbol, "1d",       30)
+
+                    if not candles_entry:
+                        continue
+
+                    bias_data   = get_htf_bias(candles_daily, candles_bias)
+                    bias        = bias_data["bias"]
+                    confirm_bos = detect_bos(candles_confirm, lookback=48)
+                    snap        = full_structure_snapshot(symbol, candles_entry, candles_confirm, candles_bias)
+                    sweep        = snap.get("recent_sweep")
+                    displacement = snap.get("displacement", {})
+                    order_block  = snap.get("order_block", {})
+                    indu         = snap.get("inducement_zones", [])
+                    sym_short    = symbol.replace("USDT", "").replace("_USDT", "")
+                    tf_label     = f"{entry_tf.upper()} entry | {confirm_tf.upper()} confirm | {bias_tf.upper()} bias"
 
                     if "sweep" in conds and sweep and sweep.get("age_candles", 99) <= 3:
                         sweep_time = sweep.get("open_time", "")[:16]
                         key = f"user_{chat_id}_sweep_{symbol}_{round(sweep['level'], 2)}_{sweep_time}"
                         if _is_cooled_down(key, SWEEP_COOLDOWN):
-                            explanation = _explain_sweep(symbol, sweep, snap["bias_data"])
-                            sym_short = symbol.replace("USDT", "")
+                            explanation = _explain_sweep(symbol, sweep, bias_data)
                             msg_lines = [
-                                f"🎯 <b>YOUR WATCHLIST ALERT — {sym_short}</b>",
+                                f"🎯 <b>YOUR WATCHLIST — {sym_short} {entry_tf.upper()} SWEEP</b>",
                                 f"",
                                 f"{sweep['description']}",
-                                f"Bias: <b>{bias.upper()}</b>  |  Price: {price:.4f}",
+                                f"Bias ({bias_tf.upper()}): <b>{bias.upper()}</b>",
+                                f"BOS ({confirm_tf.upper()}): {'✅ ' + confirm_bos.get('bias','').upper() if confirm_bos.get('broken') else '⏳ Not confirmed'}",
+                                f"TF Stack: {tf_label}",
                             ]
+                            if displacement.get("confirmed"):
+                                msg_lines.append(f"✅ {displacement['description']}")
+                                if order_block.get("found"):
+                                    msg_lines.append(f"📦 OB: {order_block['low']:.4f}–{order_block['high']:.4f}")
+                            else:
+                                msg_lines.append("⚠️ No displacement yet")
                             if indu:
                                 z = indu[0]
                                 msg_lines.append(f"Next inducement: {z['price']:.4f} ({z['distance_pct']:+.1f}%)")
                             if explanation:
                                 msg_lines += ["", explanation]
                             if watch.get("note"):
-                                msg_lines.append(f"\n📌 Your note: {watch['note']}")
+                                msg_lines.append(f"\n📌 {watch['note']}")
                             msg_lines.append(f"\n{datetime.now(timezone.utc).strftime('%H:%M UTC')}")
                             if _send_fn:
                                 _send_fn(chat_id, "\n".join(msg_lines))
                             _mark_alerted(key)
+                            _persist_state()
 
-                    if "bos" in conds and bos.get("broken") and bos.get("candle_idx", 0) >= len(candles_h1) - 2:
-                        bos_bias = bos.get("bias", "")
-                        bos_time = bos.get("open_time", "")[:16]
-                        key = f"user_{chat_id}_bos_{symbol}_{round(bos.get('level',0),2)}_{bos_bias}_{bos_time}"
+                    if "bos" in conds and confirm_bos.get("broken") and \
+                            confirm_bos.get("candle_idx", 0) >= len(candles_confirm) - 2:
+                        bos_bias = confirm_bos.get("bias", "")
+                        bos_time = confirm_bos.get("open_time", "")[:16]
+                        key = f"user_{chat_id}_bos_{symbol}_{round(confirm_bos.get('level',0),2)}_{bos_bias}_{bos_time}"
                         if _is_cooled_down(key, BOS_COOLDOWN):
-                            sym_short = symbol.replace("USDT", "")
+                            alignment = "✅ WITH bias" if bos_bias == bias else "⚠️ AGAINST bias"
                             msg_lines = [
-                                f"⚡ <b>YOUR WATCHLIST ALERT — {sym_short}</b>",
+                                f"⚡ <b>YOUR WATCHLIST — {sym_short} {confirm_tf.upper()} BOS</b>",
                                 f"",
-                                f"{bos.get('description', '')}",
-                                f"HTF Bias: <b>{bias.upper()}</b>",
-                                f"Alignment: {'✅ WITH bias' if bos_bias == bias else '⚠️ AGAINST bias'}",
+                                f"{confirm_bos.get('description', '')}",
+                                f"Bias ({bias_tf.upper()}): <b>{bias.upper()}</b>  |  {alignment}",
+                                f"👀 Watch {entry_tf.upper()} for entry sweep",
                             ]
                             if indu:
                                 z = indu[0]
                                 msg_lines.append(f"Next inducement: {z['price']:.4f} ({z['distance_pct']:+.1f}%)")
                             if watch.get("note"):
-                                msg_lines.append(f"\n📌 Your note: {watch['note']}")
+                                msg_lines.append(f"\n📌 {watch['note']}")
                             msg_lines.append(f"\n{datetime.now(timezone.utc).strftime('%H:%M UTC')}")
                             if _send_fn:
                                 _send_fn(chat_id, "\n".join(msg_lines))
                             _mark_alerted(key)
+                            _persist_state()
 
-                    # ── Funding rate monitoring ───────────────────────────
                     funding_conds = [c for c in conds if c.startswith("funding")]
                     if funding_conds:
                         try:
                             from app.mexc_data import get_funding_rate
                             fd = get_funding_rate(symbol)
                             if fd.get("ok"):
-                                rate = fd["funding_rate"]
+                                rate    = fd["funding_rate"]
                                 next_ms = fd.get("next_settle_time", 0)
                                 now_ms  = int(time.time() * 1000)
                                 mins    = max(0, (next_ms - now_ms) // 60000) if next_ms else 999
-                                sym_short = symbol.replace("USDT", "").replace("_USDT", "")
-
                                 fire = False
                                 rate_desc = ""
                                 if "funding_negative" in funding_conds and rate < 0:
@@ -516,7 +540,6 @@ def _run_user_watchlist_scan():
                                 elif "funding_change" in funding_conds and abs(rate) > 0.0005:
                                     fire = True
                                     rate_desc = f"Funding notable: {rate*100:+.4f}%"
-
                                 if fire:
                                     key = f"user_{chat_id}_funding_{symbol}_{rate > 0}"
                                     if _is_cooled_down(key, 3600):
@@ -524,7 +547,7 @@ def _run_user_watchlist_scan():
                                             f"💰 <b>YOUR FUNDING ALERT — {sym_short}</b>\n\n"
                                             f"{rate_desc}\n"
                                             f"Settlement in: {mins}min\n"
-                                            f"{'Bearish pressure at settlement — longs may close' if rate > 0 else 'Short squeeze risk — shorts paying to hold'}"
+                                            f"{'Bearish pressure at settlement' if rate > 0 else 'Short squeeze risk'}"
                                         )
                                         if watch.get("note"):
                                             msg += f"\n\n📌 {watch['note']}"
