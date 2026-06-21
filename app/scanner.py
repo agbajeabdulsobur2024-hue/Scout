@@ -372,7 +372,7 @@ def run_structure_scan():
                         log.info(f"scanner: sweep alert sent for {symbol}")
 
                 # ── Alert on fresh BOS (within last 5 H1 candles) ────────
-                if bos.get("broken") and bos.get("candle_idx", 0) >= len(candles_h1) - 5:
+                if bos.get("broken") and bos.get("candle_idx", 0) >= len(candles_h1) - 2:
                     bos_bias = bos.get("bias", "")
                     bos_time = bos.get("open_time", "")[:16]
                     key = f"bos_{symbol}_{round(bos.get('level', 0), 2)}_{bos_bias}_{bos_time}"
@@ -469,7 +469,7 @@ def _run_user_watchlist_scan():
                                 _send_fn(chat_id, "\n".join(msg_lines))
                             _mark_alerted(key)
 
-                    if "bos" in conds and bos.get("broken") and bos.get("candle_idx", 0) >= len(candles_h1) - 5:
+                    if "bos" in conds and bos.get("broken") and bos.get("candle_idx", 0) >= len(candles_h1) - 2:
                         bos_bias = bos.get("bias", "")
                         bos_time = bos.get("open_time", "")[:16]
                         key = f"user_{chat_id}_bos_{symbol}_{round(bos.get('level',0),2)}_{bos_bias}_{bos_time}"
@@ -491,6 +491,49 @@ def _run_user_watchlist_scan():
                             if _send_fn:
                                 _send_fn(chat_id, "\n".join(msg_lines))
                             _mark_alerted(key)
+
+                    # ── Funding rate monitoring ───────────────────────────
+                    funding_conds = [c for c in conds if c.startswith("funding")]
+                    if funding_conds:
+                        try:
+                            from app.mexc_data import get_funding_rate
+                            fd = get_funding_rate(symbol)
+                            if fd.get("ok"):
+                                rate = fd["funding_rate"]
+                                next_ms = fd.get("next_settle_time", 0)
+                                now_ms  = int(time.time() * 1000)
+                                mins    = max(0, (next_ms - now_ms) // 60000) if next_ms else 999
+                                sym_short = symbol.replace("USDT", "").replace("_USDT", "")
+
+                                fire = False
+                                rate_desc = ""
+                                if "funding_negative" in funding_conds and rate < 0:
+                                    fire = True
+                                    rate_desc = f"Funding went NEGATIVE: {rate*100:+.4f}% (shorts paying)"
+                                elif "funding_positive" in funding_conds and rate > 0.001:
+                                    fire = True
+                                    rate_desc = f"Funding HIGH POSITIVE: {rate*100:+.4f}% (longs paying)"
+                                elif "funding_change" in funding_conds and abs(rate) > 0.0005:
+                                    fire = True
+                                    rate_desc = f"Funding notable: {rate*100:+.4f}%"
+
+                                if fire:
+                                    key = f"user_{chat_id}_funding_{symbol}_{rate > 0}"
+                                    if _is_cooled_down(key, 3600):
+                                        msg = (
+                                            f"💰 <b>YOUR FUNDING ALERT — {sym_short}</b>\n\n"
+                                            f"{rate_desc}\n"
+                                            f"Settlement in: {mins}min\n"
+                                            f"{'Bearish pressure at settlement — longs may close' if rate > 0 else 'Short squeeze risk — shorts paying to hold'}"
+                                        )
+                                        if watch.get("note"):
+                                            msg += f"\n\n📌 {watch['note']}"
+                                        if _send_fn:
+                                            _send_fn(chat_id, msg)
+                                        _mark_alerted(key)
+                                        _persist_state()
+                        except Exception as _fe:
+                            log.debug(f"funding monitor {symbol}: {_fe}")
 
                 except Exception as e:
                     log.debug(f"user watchlist scan {symbol} for {chat_id}: {e}")

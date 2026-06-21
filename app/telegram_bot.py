@@ -36,60 +36,76 @@ def _parse_monitor_request(text: str) -> dict:
     Parse natural-language monitor requests.
     Examples:
       "monitor BTCUSDT on 1H for sweeps"
-      "watch SOL 4h sweeps and BOS"
-      "monitor ETH — looking for displacement after sweep of lows"
+      "watch Sol 4h sweeps and BOS"
+      "monitor Asteroid when funding goes negative"
       "stop monitoring BTC"
-      "remove ETH from watchlist"
-    Returns {action, symbol, tf, conditions, note} or None
     """
     text_lower = text.lower()
 
     # Stop monitoring
     if any(w in text_lower for w in ["stop monitor", "remove", "unwatch", "stop watch"]):
-        sym_match = re.search(r'\b([A-Za-z]{2,10})(usdt)?\b', text, re.IGNORECASE)
+        sym_match = re.search(r'\b([A-Za-z]{2,12})(usdt|USDT)?\b', text, re.IGNORECASE)
         if sym_match:
-            return {"action": "remove", "symbol": sym_match.group(1)}
+            return {"action": "remove", "symbol": sym_match.group(1).upper()}
         return None
 
-    # Start monitoring
-    if any(w in text_lower for w in ["monitor", "watch", "alert me", "track"]):
-        # Extract symbol
-        sym_match = re.search(r'\b([A-Z]{2,10})(USDT)?\b', text)
-        if not sym_match:
-            return None
-        symbol = sym_match.group(1)
+    # Start monitoring — catches "monitor", "watch", "alert me", "track",
+    # "inform me", "tell me", "notify me" in any sentence form
+    trigger_words = ["monitor", "watch", "alert", "track", "inform me", "tell me", "notify"]
+    if not any(w in text_lower for w in trigger_words):
+        return None
 
-        # Extract timeframe
-        tf = "1h"
-        tf_match = re.search(r'\b(\d+)\s*(h|hour|m|min|d|day)\b', text_lower)
-        if tf_match:
-            n, unit = tf_match.group(1), tf_match.group(2)
-            tf = f"{n}h" if unit.startswith("h") else f"{n}m" if unit.startswith("m") else f"{n}d"
+    # Extract symbol — accepts ANY capitalisation (BTC, btc, Bitcoin, Asteroid)
+    # Exclude common English words that match the pattern
+    STOPWORDS = {"can", "you", "me", "and", "for", "when", "the", "get", "all",
+                 "now", "this", "that", "with", "from", "any", "new", "goes"}
+    sym_match = re.search(r'\b([A-Za-z]{2,12})\b', text)
+    symbol = ""
+    # Walk all words and pick the first one that looks like a symbol
+    for word in re.findall(r'\b[A-Za-z]{2,12}\b', text):
+        if word.lower() not in STOPWORDS and word.lower() not in trigger_words:
+            symbol = word.upper()
+            break
+    if not symbol:
+        return None
 
-        # Extract conditions
-        conditions = []
-        if any(w in text_lower for w in ["sweep", "hunt", "liquidity"]):
-            conditions.append("sweep")
-        if any(w in text_lower for w in ["bos", "break", "structure"]):
-            conditions.append("bos")
-        if not conditions:
-            conditions = ["sweep", "bos"]  # default: both
+    # Extract timeframe
+    tf = "1h"
+    tf_match = re.search(r'\b(\d+)\s*(h|hour|m|min|d|day)\b', text_lower)
+    if tf_match:
+        n, unit = tf_match.group(1), tf_match.group(2)
+        tf = f"{n}h" if unit.startswith("h") else f"{n}m" if unit.startswith("m") else f"{n}d"
 
-        # Extract note (anything after "—" or "note:" or "because")
-        note = ""
-        note_match = re.search(r'[—\-]{1,2}\s*(.+)$', text)
-        if note_match:
-            note = note_match.group(1).strip()
+    # Extract conditions — including funding
+    conditions = []
+    if any(w in text_lower for w in ["sweep", "hunt", "liquidity"]):
+        conditions.append("sweep")
+    if any(w in text_lower for w in ["bos", "break", "structure"]):
+        conditions.append("bos")
+    if any(w in text_lower for w in ["funding", "fund", "rate"]):
+        # Check for direction
+        if any(w in text_lower for w in ["negative", "neg", "shorts pay", "below zero"]):
+            conditions.append("funding_negative")
+        elif any(w in text_lower for w in ["positive", "pos", "longs pay", "above zero"]):
+            conditions.append("funding_positive")
+        else:
+            conditions.append("funding_change")
+    if not conditions:
+        conditions = ["sweep", "bos"]
 
-        return {
-            "action": "add",
-            "symbol": symbol,
-            "tf": tf,
-            "conditions": conditions,
-            "note": note,
-        }
+    # Extract note
+    note = ""
+    note_match = re.search(r'[—\-]{1,2}\s*(.+)$', text)
+    if note_match:
+        note = note_match.group(1).strip()
 
-    return None
+    return {
+        "action":     "add",
+        "symbol":     symbol,
+        "tf":         tf,
+        "conditions": conditions,
+        "note":       note,
+    }
 
 
 def handle_update(update: dict) -> None:
@@ -295,8 +311,14 @@ def handle_update(update: dict) -> None:
 
     if text.lower().startswith("/bias"):
         parts  = text.split()
-        symbol = (parts[1].upper() + "USDT").replace("USDTUSDT", "USDT") if len(parts) > 1 else "BTCUSDT"
-        send_message(chat_id, f"Analysing {symbol} structure...")
+        if len(parts) < 2:
+            send_message(chat_id,
+                "Which symbol? e.g. <b>/bias SOL</b> or <b>/bias BTC</b>\n"
+                "You can also just say: <i>what's the bias on ETH</i>"
+            )
+            return
+        symbol = (parts[1].upper() + "USDT").replace("USDTUSDT", "USDT")
+        send_message(chat_id, f"Analysing {symbol}...")
         reply = reasoning.explain_structure(symbol)
         send_message(chat_id, reply)
         return
