@@ -1,209 +1,317 @@
 """
-reasoning.py — turns raw market_data snapshots into trader-facing answers,
-via 0G Compute. This module never invents numbers and never pretends to
-predict price; it explains what the data shows and lets the model reason
-about *why* it might matter. The interpretation is genuinely produced by
-the model on each call — there's no cached/templated answer underneath.
+reasoning.py — Scout's reasoning layer.
+
+Architecture (updated):
+  Market Data
+  ↓
+  Intelligence Engine (intelligence.py) — extracts FACTS
+  ↓
+  0G Compute — explains facts, evidence-based
+  ↓
+  Telegram response
+
+The model no longer guesses. It receives structured intelligence and
+explains what the data actually shows.
+
+Evidence-Based Prompt Format:
+  1. Market Condition
+  2. Evidence
+  3. Risks
+  4. Opportunity
+  5. Confidence
 """
 
 import logging
 from app import market_data
 from app.zg_compute import ask, ZGComputeError
+from app.intelligence import (
+    build_intelligence,
+    format_intelligence_for_model,
+    rank_opportunities,
+)
 
 log = logging.getLogger("scout")
 
 SYSTEM_PROMPT = (
     "You are Scout, an AI market intelligence companion for a professional crypto trader. "
-    "You reason using Smart Money Concepts (SMC). Always use this framework:\n\n"
+    "You reason using Smart Money Concepts (SMC).\n\n"
 
-    "KEY CONCEPTS:\n"
-    "- Liquidity sweeps: price wicks into a prior swing high/low (stop hunt), then rejects. "
-    "Bullish sweep = sweep of lows (hunts buy stops), price closes back above. "
-    "Bearish sweep = sweep of highs (hunts sell stops), price closes back below.\n"
-    "- Displacement: strong impulsive move AFTER a sweep, leaving an imbalance (FVG). "
-    "This confirms the sweep was engineered, not random.\n"
-    "- Break of Structure (BOS): price closes beyond a prior swing high (bullish BOS) or "
-    "swing low (bearish BOS). Confirms trend change or continuation.\n"
-    "- Inducement: equal highs/lows just ahead of price — liquidity pool that will be hunted "
-    "before the real move. Not the target, the trap before the target.\n"
-    "- Order Block (OB): the last bearish candle before a bullish displacement, or the last "
-    "bullish candle before a bearish displacement. Price returns to this for entries.\n"
-    "- Fair Value Gap (FVG): a 3-candle imbalance where the middle candle has a gap between "
-    "the first and third candle's wicks. Price fills these.\n"
-    "- HTF bias: Daily > H4 > H1 > M15. Higher timeframe bias determines direction. "
-    "Only take trades IN the direction of HTF bias.\n"
-    "- Kill zones: London (08:00-11:00 UTC) and New York (13:00-16:00 UTC) sessions are "
-    "when the highest quality setups form.\n"
+    "CRITICAL RULE: Only use the supplied market intelligence data. "
+    "Do not invent price levels, percentages, or conditions not in the data. "
+    "Do not make assumptions. If a data point is missing, say so.\n\n"
+
+    "RESPONSE FORMAT — always structure your answer as:\n"
+    "1. MARKET CONDITION: What regime and bias the market is in right now\n"
+    "2. EVIDENCE: Specific facts from the intelligence data (sweep, displacement, BOS, etc)\n"
+    "3. RISKS: What could invalidate this read\n"
+    "4. OPPORTUNITY: Is there a trade setup? Entry zone, target, invalidation level\n"
+    "5. CONFIDENCE: Low/Medium/High — based on how many confluence factors are present\n\n"
+
+    "KEY SMC CONCEPTS:\n"
+    "- Liquidity sweep: price wicks into a prior swing H/L (stop hunt), then rejects. "
+    "Bullish sweep = hunts lows then closes back above. "
+    "Bearish sweep = hunts highs then closes back below.\n"
+    "- Displacement: strong impulsive candle AFTER a sweep (body ≥55% of range). "
+    "Confirms the sweep was engineered.\n"
+    "- BOS: price closes beyond a prior swing. Confirms structure shift.\n"
+    "- Order Block (OB): last opposing candle before displacement. Entry zone.\n"
+    "- FVG: 3-candle imbalance. Price tends to fill these.\n"
+    "- Inducement: equal H/L just ahead of price — the trap before the real move.\n"
+    "- Kill zones: London (08:00–11:00 UTC) and New York (13:00–16:00 UTC).\n"
     "- Regime: Expansion (trending), Compression (ranging), Exhaustion (reversal pending).\n\n"
 
-    "WHEN EXPLAINING A SETUP: state the bias, what liquidity was swept, whether displacement "
-    "confirmed, where the OB or FVG is for entry, what invalidates the setup.\n"
-    "WHEN ASSESSING A MOVE: does it have sweep + displacement? Is it with or against HTF bias?\n"
-    "WHEN ASSESSING MEXC CRIME: look for engineered moves — sudden spike with no displacement "
-    "after, volume spike then immediate reversal, coordinated dumps across multiple low-caps.\n\n"
-
-    "Be specific about price levels. Never say 'it could go up or down.' "
-    "Give a directional read with reasoning. Under 150 words unless asked for more."
+    "Be specific about price levels from the data. Under 200 words unless asked for more. "
+    "Never say 'it could go up or down' without giving a directional lean with reasoning."
 )
-
-
-def _format_snapshot(snap: dict) -> str:
-    t = snap.get("ticker") or {}
-    f = snap.get("funding")
-    lines = [
-        f"Symbol: {snap.get('symbol')}",
-        f"Price: {t.get('price')}  (24h change: {t.get('change_pct_24h')}%)",
-        f"24h range: {t.get('low_24h')} - {t.get('high_24h')}",
-        f"24h volume: {t.get('volume_24h')}",
-        f"15m range position (0=at recent low, 1=at recent high): {snap.get('range_position_15m')}",
-        f"15m volume vs recent average: {snap.get('volume_spike_15m')}x",
-    ]
-    if f:
-        lines.append(f"Funding rate: {f.get('funding_rate')}")
-    if "signal_strength" in snap:
-        lines.append(f"Computed signal-strength score (0-100, deterministic, not from you): {snap['signal_strength']}")
-    return "\n".join(lines)
 
 
 def explain_symbol(symbol: str, user_question: str = "") -> str:
     """
-    'Why is BTC rejecting?' / 'What's happening with SOL?' — fetch fresh
-    data for one symbol and ask 0G Compute to explain it.
+    Fetch full intelligence for a symbol and ask 0G Compute to explain it.
+    This is the primary path for 'What's happening with BTC?'
     """
-    snap = market_data.snapshot(symbol)
-    snap["signal_strength"] = market_data.signal_strength(snap)
-    context = _format_snapshot(snap)
+    from app.market_data import get_klines
+    from app.mexc_data import get_funding_rate as mexc_funding
 
-    question = user_question or f"What does this data suggest is happening with {symbol} right now, and why?"
+    # Fetch candles at all TFs
+    try:
+        c_m15   = get_klines(symbol, "15m", 96)
+        c_h1    = get_klines(symbol, "1h",  50)
+        c_h4    = get_klines(symbol, "4h",  50)
+        c_daily = get_klines(symbol, "1d",  30)
+    except Exception as e:
+        return f"⚠️ Couldn't fetch market data for {symbol}: {e}"
+
+    # Funding
+    funding_rate = 0.0
+    try:
+        fd = mexc_funding(symbol)
+        if fd.get("ok"):
+            funding_rate = fd["funding_rate"]
+        else:
+            # Binance fallback
+            fd2 = market_data.get_funding_rate(symbol)
+            funding_rate = fd2.get("funding_rate", 0.0)
+    except Exception:
+        pass
+
+    # Build intelligence
+    intel = build_intelligence(
+        symbol        = symbol,
+        candles_m15   = c_m15,
+        candles_h1    = c_h1,
+        candles_h4    = c_h4,
+        candles_daily = c_daily,
+        funding_rate  = funding_rate,
+    )
+
+    context  = format_intelligence_for_model(intel)
+    question = user_question or (
+        f"Based on this intelligence data, what is the current market condition "
+        f"for {symbol.replace('USDT','')} and is there a trade setup forming?"
+    )
+
     try:
         return ask([
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"Current data:\n{context}\n\nQuestion: {question}"},
-        ])
+            {"role": "user",   "content": f"{context}\n\nQuestion: {question}"},
+        ], max_tokens=400)
     except ZGComputeError as e:
         log.error(f"explain_symbol({symbol}) failed: {e}")
-        return f"⚠️ Couldn't reach 0G Compute right now ({e}). Raw data:\n{context}"
+        return f"⚠️ Couldn't reach 0G Compute ({e}).\n\nRaw intelligence:\n{context}"
 
 
-def best_opportunities(symbols: list = None, top_n: int = 3) -> str:
+def explain_structure(symbol: str) -> str:
     """
-    SMC-based opportunity scan — replaces the old volume/range signal strength.
-    Scans the watchlist for symbols with confirmed sweep + displacement,
-    ranks by HTF bias alignment and displacement quality.
-    0G Compute explains the top setups.
+    '/bias BTC' — full SMC structure picture with intelligence engine.
     """
     from app.market_data import get_klines
-    from app.structure import full_structure_snapshot
+    from app.mexc_data import get_funding_rate as mexc_funding
 
-    symbols = symbols or market_data.DEFAULT_WATCHLIST
-    results = []
+    try:
+        c_m15   = get_klines(symbol, "15m", 96)
+        c_h1    = get_klines(symbol, "1h",  50)
+        c_h4    = get_klines(symbol, "4h",  50)
+        c_daily = get_klines(symbol, "1d",  30)
+    except Exception as e:
+        return f"⚠️ Couldn't fetch data for {symbol}: {e}"
 
-    for symbol in symbols:
+    funding_rate = 0.0
+    try:
+        fd = mexc_funding(symbol)
+        if fd.get("ok"):
+            funding_rate = fd["funding_rate"]
+    except Exception:
+        pass
+
+    intel   = build_intelligence(symbol, c_m15, c_h1, c_h4, c_daily, funding_rate)
+    context = format_intelligence_for_model(intel)
+
+    question = (
+        "Based on this intelligence data, provide:\n"
+        "1. The overall bias and regime — and why\n"
+        "2. What the sweep/BOS evidence means for next move\n"
+        "3. Key levels to watch (OB, FVG, inducement zones)\n"
+        "4. What specifically confirms or invalidates a trade setup\n"
+        "Keep it under 200 words."
+    )
+
+    try:
+        return ask([
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user",   "content": f"{context}\n\n{question}"},
+        ], max_tokens=400)
+    except ZGComputeError as e:
+        return f"Structure intelligence:\n{context}\n\n⚠️ 0G Compute unavailable: {e}"
+
+
+def best_opportunities(symbols: list = None, top_n: int = 5) -> str:
+    """
+    Rank all watchlist symbols by opportunity score, then ask 0G Compute
+    to explain the top setups. Uses the intelligence engine for proper scoring.
+    """
+    from app.market_data import get_klines, DEFAULT_WATCHLIST
+    from app.mexc_data import get_funding_rate as mexc_funding
+
+    symbols = symbols or DEFAULT_WATCHLIST
+
+    # Build candle map for all symbols
+    candles_map  = {}
+    funding_map  = {}
+
+    for sym in symbols:
         try:
-            c1h = get_klines(symbol, "1h", 50)
-            c4h = get_klines(symbol, "4h", 50)
-            cd  = get_klines(symbol, "1d", 30)
-            snap = full_structure_snapshot(symbol, c1h, c4h, cd)
-
-            sweep = snap.get("recent_sweep")
-            disp  = snap.get("displacement", {})
-            bos   = snap.get("bos_h1", {})
-            bias  = snap.get("bias", "neutral")
-            indu  = snap.get("inducement_zones", [])
-            price = snap.get("current_price", 0)
-
-            # Score: sweep + displacement = strongest, BOS alone = moderate
-            score = 0
-            if sweep and sweep.get("entry_valid"):
-                score += 40
-                if disp.get("confirmed"):
-                    score += 40
-                if sweep.get("has_rejection"):
-                    score += 10
-                if sweep.get("is_equal_hl"):
-                    score += 10
-            elif bos.get("broken"):
-                score += 30
-
-            # Bias alignment bonus
-            if bias != "neutral":
-                score += 10
-
-            if score > 0:
-                results.append({
-                    "symbol": symbol,
-                    "score":  score,
-                    "bias":   bias,
-                    "sweep":  sweep,
-                    "disp":   disp,
-                    "bos":    bos,
-                    "indu":   indu,
-                    "price":  price,
-                    "snap":   snap,
-                })
+            candles_map[sym] = {
+                "m15":   get_klines(sym, "15m", 96),
+                "h1":    get_klines(sym, "1h",  50),
+                "h4":    get_klines(sym, "4h",  50),
+                "daily": get_klines(sym, "1d",  30),
+            }
         except Exception as e:
-            log.debug(f"best_opportunities {symbol}: {e}")
+            log.debug(f"best_opportunities candles {sym}: {e}")
 
-    if not results:
+        try:
+            fd = mexc_funding(sym)
+            if fd.get("ok"):
+                funding_map[sym] = fd["funding_rate"]
+        except Exception:
+            pass
+
+    # Rank
+    top = rank_opportunities(symbols, candles_map, funding_map, top_n=top_n)
+
+    if not top:
         return (
-            "No confirmed SMC setups across the watchlist right now.\n"
+            "No setups with confirmed structure across the watchlist right now.\n"
             "Scanner checks every 10 minutes — you'll get an alert when one forms."
         )
 
-    results.sort(key=lambda x: x["score"], reverse=True)
-    top = results[:top_n]
+    # Build ranking header
+    header_lines = ["<b>🏆 Opportunity Ranking</b>\n"]
+    for i, intel in enumerate(top, 1):
+        sym   = intel["symbol"].replace("USDT", "")
+        score = intel["score"]
+        bias  = intel["htf_bias"]
+        regime = intel["regime"]
 
-    # Build context for 0G Compute
+        # Score indicator
+        if score >= 75:
+            bar = "🟢"
+        elif score >= 50:
+            bar = "🟡"
+        else:
+            bar = "🔴"
+
+        # One-line summary of key signals
+        signals = []
+        if intel.get("sweep", {}).get("detected"):
+            signals.append("sweep")
+        if intel.get("displacement", {}).get("confirmed"):
+            signals.append("displacement")
+        if intel.get("bos", {}).get("broken"):
+            signals.append("BOS")
+        sig_str = " + ".join(signals) if signals else "no structure yet"
+
+        header_lines.append(
+            f"{bar} {i}. <b>{sym}</b>  Score: {score}/100  "
+            f"({bias} | {regime})\n"
+            f"   <i>{sig_str}</i>"
+        )
+
+    header = "\n".join(header_lines)
+
+    # Build context for 0G Compute — give it the intelligence for each
     blocks = []
-    for r in top:
-        sym   = r["symbol"].replace("USDT", "")
-        bias  = r["bias"].upper()
-        sweep = r["sweep"]
-        disp  = r["disp"]
-        bos   = r["bos"]
-        indu  = r["indu"]
+    for intel in top:
+        blocks.append(format_intelligence_for_model(intel))
 
-        lines = [f"Symbol: {sym}  |  Bias: {bias}  |  Price: {r['price']:.4f}"]
-        if sweep:
-            lines.append(f"Sweep: {sweep.get('description', '')}")
-        if disp.get("confirmed"):
-            lines.append(f"Displacement: {disp.get('description', '')}")
-        if bos.get("broken"):
-            lines.append(f"BOS: {bos.get('description', '')}")
-        if indu:
-            lines.append(f"Next inducement: {indu[0]['price']:.4f} ({indu[0]['distance_pct']:+.1f}%)")
-        blocks.append("\n".join(lines))
-
-    context   = "\n\n".join(blocks)
-    header    = "\n".join(
-        f"{i+1}. {r['symbol'].replace('USDT','')}  — setup score {r['score']}/100  ({r['bias'].upper()} bias)"
-        for i, r in enumerate(top)
-    )
-    question  = (
-        "These are the highest-scoring SMC setups right now based on sweep, "
-        "displacement, and bias alignment. For each one, give a 1-2 sentence "
-        "read: is this worth watching, what confirms it, what invalidates it."
+    context  = "\n\n---\n\n".join(blocks)
+    question = (
+        "These are the top-ranked SMC opportunities right now, sorted by score. "
+        "For each symbol, give a 2-sentence read: "
+        "what the evidence shows and whether it's worth watching. "
+        "Be specific about levels. Reference the intelligence data — do not guess."
     )
 
     try:
         explanation = ask([
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user",   "content": f"{context}\n\n{question}"},
-        ], max_tokens=350)
+        ], max_tokens=600)
         return f"{header}\n\n{explanation}"
     except ZGComputeError as e:
         return f"{header}\n\n⚠️ 0G Compute unavailable: {e}"
 
 
+def explain_crime_move(mover: dict) -> str:
+    """Ask 0G Compute to explain a suspicious MEXC mover."""
+    try:
+        sym   = mover["symbol"].replace("_USDT", "")
+        chg   = mover["change_pct"]
+        vol   = mover.get("volume_24h", 0)
+        rvol  = mover.get("rvol", 1.0)
+        vel   = mover.get("velocity", 1.0)
+        rng   = mover.get("range_pct", 0)
+        score = mover.get("crime_score", 0)
+
+        # Build structured prompt — facts first
+        context = (
+            f"=== CRIME DETECTION: {sym}/USDT ===\n\n"
+            f"24h Move:        {chg:+.1f}% ({mover.get('direction', 'UNKNOWN')})\n"
+            f"Volume vs Normal: {rvol:.1f}x\n"
+            f"Price Velocity:  {vel:.1f}x (recent vs prior period)\n"
+            f"Daily Range:     {rng:.1f}% of price\n"
+            f"Crime Score:     {score:.0f}\n"
+            f"Volume 24h:      {vol:,.0f}\n"
+        )
+
+        prompt = (
+            f"{context}\n\n"
+            f"Analyze this suspicious move. Answer:\n"
+            f"1. Does this look like coordinated manipulation or organic? Why?\n"
+            f"2. What pattern does this match (pump-and-dump, stop hunt, whale accumulation)?\n"
+            f"3. What should a trader watch for next — continuation, reversal, or trap?\n"
+            f"Keep it under 120 words. Be direct."
+        )
+
+        return ask([
+            {"role": "system", "content":
+             "You are Scout, a market intelligence companion. Analyze market crime patterns. "
+             "Only use the data provided. Be direct — if it looks like manipulation, say so."},
+            {"role": "user", "content": prompt},
+        ], max_tokens=180)
+    except Exception:
+        return ""
+
+
 def chat(message: str, recent_context: list = None) -> str:
     """
-    General chat — used for anything that isn't a direct 'explain X' or
-    'best opportunities' command. recent_context is an optional list of
-    prior {"role","content"} turns for short-term continuity.
+    General chat — free-form questions. Tries to extract relevant intelligence
+    if a symbol is mentioned, otherwise uses pure model reasoning.
     """
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     if recent_context:
-        messages.extend(recent_context[-6:])  # keep it small
+        messages.extend(recent_context[-6:])
     messages.append({"role": "user", "content": message})
     try:
         return ask(messages, max_tokens=400)
@@ -212,9 +320,10 @@ def chat(message: str, recent_context: list = None) -> str:
         return f"⚠️ Couldn't reach 0G Compute right now ({e})."
 
 
-# ── Lightweight intent routing — no slash commands required ──────────────
+# ── Intent routing ────────────────────────────────────────────────────────
 _KNOWN_SYMBOLS = {s.replace("USDT", ""): s for s in market_data.DEFAULT_WATCHLIST}
-_OPPORTUNITY_WORDS = ("best", "opportunit", "setup", "what should i", "anything good")
+_OPPORTUNITY_WORDS = ("best", "opportunit", "setup", "what should i", "anything good",
+                      "rank", "top setup", "what's hot", "what is hot")
 
 
 def _find_symbol(text: str) -> str:
@@ -227,8 +336,7 @@ def _find_symbol(text: str) -> str:
 
 def route_message(text: str, recent_context: list = None) -> str:
     """
-    Decide what a free-text message is asking for and dispatch to the
-    right function. This is the only entry point telegram_bot.py needs.
+    Route free-text to the right function.
     """
     symbol = _find_symbol(text)
     if symbol:
@@ -236,102 +344,3 @@ def route_message(text: str, recent_context: list = None) -> str:
     if any(w in text.lower() for w in _OPPORTUNITY_WORDS):
         return best_opportunities()
     return chat(text, recent_context=recent_context)
-
-
-def explain_crime_move(mover: dict) -> str:
-    """Ask 0G Compute to explain the most extreme MEXC mover."""
-    try:
-        sym = mover["symbol"].replace("_USDT", "")
-        chg = mover["change_pct"]
-        vol = mover.get("volume_24h", 0)
-        prompt = (
-            f"MEXC futures — {sym}/USDT moved {chg:+.1f}% in 24h "
-            f"with volume {vol:,.0f}.\n\n"
-            f"In 2-3 sentences: does this look coordinated or organic? "
-            f"What should a trader watch for — continuation, reversal, or trap?"
-        )
-        return ask([
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": prompt},
-        ], max_tokens=120)
-    except Exception:
-        return ""
-    """
-    '/bias BTC' — full SMC structure picture for one symbol:
-    HTF bias, recent sweep, last BOS, inducement zones.
-    """
-    from app.market_data import get_klines
-    from app.structure import full_structure_snapshot
-
-    try:
-        candles_h1    = get_klines(symbol, "1h",  50)
-        candles_h4    = get_klines(symbol, "4h",  50)
-        candles_daily = get_klines(symbol, "1d",  30)
-        snap = full_structure_snapshot(symbol, candles_h1, candles_h4, candles_daily)
-    except Exception as e:
-        return f"Couldn't fetch structure data for {symbol}: {e}"
-
-    bias       = snap.get("bias", "neutral")
-    bias_data  = snap.get("bias_data", {})
-    sweep      = snap.get("recent_sweep")
-    bos        = snap.get("bos_h1", {})
-    inducements= snap.get("inducement_zones", [])
-    price      = snap.get("current_price", 0)
-
-    # ── Funding rate intelligence ─────────────────────────────────────────
-    from app.market_data import get_funding_intelligence
-    funding = get_funding_intelligence(symbol, bias=bias)
-
-    context_lines = [
-        f"Symbol: {symbol}",
-        f"Current price: {price:.4f}",
-        f"HTF bias: {bias.upper()}",
-        f"Daily note: {bias_data.get('daily_note', '')}",
-        f"H4 note: {bias_data.get('h4_note', '')}",
-    ]
-    if sweep:
-        context_lines.append(f"Recent H1 sweep: {sweep.get('description', '')}")
-    if bos.get("broken"):
-        context_lines.append(f"Last H1 BOS: {bos.get('description', '')}")
-    if inducements:
-        zones = ", ".join(
-            f"{z['price']:.4f} ({z['distance_pct']:+.1f}%)"
-            for z in inducements[:3]
-        )
-        context_lines.append(f"Inducement zones: {zones}")
-    if not funding.get("error"):
-        context_lines.append(f"Funding rate: {funding.get('read', '')}")
-        if funding.get("settlement_warning"):
-            context_lines.append("⚠️ WARNING: Within 30 min of funding settlement — high volatility risk")
-
-    # ── Displacement + OB ────────────────────────────────────────────────
-    displacement = snap.get("displacement", {})
-    order_block  = snap.get("order_block", {})
-    if displacement.get("confirmed"):
-        context_lines.append(f"Displacement: {displacement.get('description', '')}")
-        if order_block.get("found"):
-            context_lines.append(f"Order Block: {order_block.get('description', '')}")
-            context_lines.append(
-                f"OB zone: {order_block.get('low', 0):.4f} – {order_block.get('high', 0):.4f}"
-            )
-    else:
-        context_lines.append(
-            f"Displacement: {displacement.get('description', displacement.get('reason', 'not confirmed'))}"
-        )
-
-    context = "\n".join(context_lines)
-    question = (
-        "Based on this structure data, give the trader:\n"
-        "1. The overall bias and why\n"
-        "2. What the recent sweep or BOS means\n"
-        "3. The most important inducement zones to watch\n"
-        "4. What to look for to confirm a trade setup\n"
-        "Keep it under 150 words."
-    )
-    try:
-        return ask([
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"{context}\n\n{question}"},
-        ], max_tokens=300)
-    except ZGComputeError as e:
-        return f"Structure data:\n{context}\n\n⚠️ 0G Compute unavailable: {e}"

@@ -3,12 +3,13 @@ scanner.py — Scout's proactive intelligence scanner.
 
 Runs as a background thread. Every N minutes it:
   1. Scans MEXC for crime (coordinated pumps/dumps)
-  2. Scans Binance watchlist for sweeps, BOS, and structure breaks
-  3. If something fires, asks 0G Compute to explain it
-  4. Sends a Telegram alert unprompted
+  2. Scans Binance watchlist using the Intelligence Engine
+  3. Ranks opportunities by score
+  4. If something fires, asks 0G Compute to explain it
+  5. Sends a Telegram alert unprompted
 
-This is what makes Scout an agent, not just a chatbot. It watches
-the market for you and speaks up when something real happens.
+The Intelligence Engine runs FIRST. 0G Compute explains FACTS.
+Not the other way around.
 """
 
 import os
@@ -19,41 +20,35 @@ from datetime import datetime, timezone
 
 log = logging.getLogger("scout")
 
-# How often to run each scan (seconds)
 MEXC_SCAN_INTERVAL      = int(os.environ.get("MEXC_SCAN_INTERVAL",  "300"))   # 5 min
 STRUCTURE_SCAN_INTERVAL = int(os.environ.get("STRUCTURE_SCAN_INTERVAL", "600")) # 10 min
+ALERT_COOLDOWN          = int(os.environ.get("ALERT_COOLDOWN", "1800"))  # 30 min
 
-# Alert dedup — don't re-alert the same event within this window (seconds)
-ALERT_COOLDOWN = int(os.environ.get("ALERT_COOLDOWN", "1800"))  # 30 min
-
-# Binance symbols to watch for sweeps/BOS
+# Crypto USDT perps to watch for structure
 STRUCTURE_WATCHLIST = [
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "AVAXUSDT",
     "LINKUSDT", "ADAUSDT", "DOTUSDT", "MATICUSDT", "XRPUSDT",
 ]
 
-_alert_cooldowns: dict = {}   # {event_key: timestamp}
-_send_fn = None               # set by start_scanner() to telegram_bot.send_message
-_chat_id = None               # set by start_scanner()
+# Min score for a proactive alert (filters noise)
+PROACTIVE_ALERT_SCORE = 60
+
+_alert_cooldowns: dict = {}
+_send_fn = None
+_chat_id = None
 _running = False
 
-# ── User watchlists ────────────────────────────────────────────────────────
-# Stores per-user custom monitoring requests.
-# Format: {chat_id: [{symbol, tf, conditions, note}]}
 _user_watchlists: dict = {}
+
+SWEEP_COOLDOWN = int(os.environ.get("SWEEP_COOLDOWN", "3600"))
+BOS_COOLDOWN   = int(os.environ.get("BOS_COOLDOWN",   "14400"))
+CRIME_COOLDOWN = int(os.environ.get("CRIME_COOLDOWN", "1800"))
 
 
 def add_user_monitor(chat_id: int, symbol: str, tf: str = "15m",
                      conditions: list = None, note: str = "",
                      entry_tf: str = "15m", confirm_tf: str = "1h",
                      bias_tf: str = "4h") -> str:
-    """
-    Register a symbol for a user's personal watchlist with their own TF stack.
-    Defaults to the core SMC strategy TFs if not specified:
-      entry_tf   = M15 (sweep + displacement)
-      confirm_tf = H1  (BOS confirmation)
-      bias_tf    = H4  (HTF bias)
-    """
     symbol = symbol.upper()
     if not symbol.endswith("USDT"):
         symbol = symbol + "USDT"
@@ -74,9 +69,7 @@ def add_user_monitor(chat_id: int, symbol: str, tf: str = "15m",
         return f"{symbol} is already on your watchlist."
 
     _user_watchlists[chat_id].append(entry)
-    log.info(f"scanner: {chat_id} added {symbol} to personal watchlist")
-
-    import threading
+    log.info(f"scanner: {chat_id} added {symbol} to watchlist")
     threading.Thread(target=_persist_state, daemon=True).start()
 
     tf_desc = f"Entry: {entry_tf.upper()} | Confirm: {confirm_tf.upper()} | Bias: {bias_tf.upper()}"
@@ -89,7 +82,6 @@ def add_user_monitor(chat_id: int, symbol: str, tf: str = "15m",
 
 
 def remove_user_monitor(chat_id: int, symbol: str) -> str:
-    """Remove a symbol from a user's personal watchlist."""
     symbol = symbol.upper()
     if not symbol.endswith("USDT"):
         symbol = symbol + "USDT"
@@ -105,32 +97,27 @@ def remove_user_monitor(chat_id: int, symbol: str) -> str:
 
 
 def clear_all_monitors(chat_id: int) -> str:
-    """Remove all monitors for a user."""
     if chat_id in _user_watchlists:
         count = len(_user_watchlists[chat_id])
         _user_watchlists[chat_id] = []
         return f"✅ Cleared {count} monitor(s). Your watchlist is now empty."
     return "Your watchlist was already empty."
-    """Return a formatted list of what's being monitored for a user."""
+
+
+def list_user_monitors(chat_id: int) -> str:
     watches = _user_watchlists.get(chat_id, [])
     if not watches:
         return "Your watchlist is empty. Say 'monitor BTCUSDT on 1H for sweeps' to add one."
     lines = ["<b>Your active monitors:</b>\n"]
     for w in watches:
         conds = ", ".join(w["conditions"])
-        lines.append(f"• <b>{w['symbol']}</b> — {w['tf'].upper()} — {conds}")
+        lines.append(f"• <b>{w['symbol']}</b> — {w.get('entry_tf','1h').upper()} — {conds}")
         if w.get("note"):
             lines.append(f"  {w['note']}")
     return "\n".join(lines)
 
 
-# Alert dedup — cooldowns per event type
-SWEEP_COOLDOWN = int(os.environ.get("SWEEP_COOLDOWN", "3600"))   # 1 hour
-BOS_COOLDOWN   = int(os.environ.get("BOS_COOLDOWN",   "14400"))  # 4 hours — a BOS doesn't expire
-CRIME_COOLDOWN = int(os.environ.get("CRIME_COOLDOWN", "1800"))   # 30 min for crime moves
-
 def _is_cooled_down(key: str, cooldown: int = None) -> bool:
-    """Check if enough time has passed since last alert for this key."""
     if cooldown is None:
         cooldown = ALERT_COOLDOWN
     last = _alert_cooldowns.get(key, 0)
@@ -142,7 +129,6 @@ def _mark_alerted(key: str):
 
 
 def _persist_state():
-    """Save cooldowns + watchlists to 0G Storage. Fire-and-forget."""
     try:
         from app.zg_storage import save_state
         save_state({
@@ -160,7 +146,6 @@ def _send_alert(text: str, alert_type: str = "alert", symbol: str = ""):
         except Exception as e:
             log.error(f"scanner: alert send failed — {e}")
 
-    # ── Log to 0G Storage (decentralized intelligence history) ───────────
     try:
         from app.zg_storage import append_alert_log
         append_alert_log({
@@ -174,62 +159,40 @@ def _send_alert(text: str, alert_type: str = "alert", symbol: str = ""):
 
 
 def _explain_crime(crime: dict) -> str:
-    """Ask 0G Compute to explain a suspicious MEXC move."""
+    """Ask 0G Compute to explain a suspicious MEXC move using structured intelligence."""
     try:
-        from app.zg_compute import ask, ZGComputeError
-        sym    = crime["symbol"].replace("_USDT", "")
-        chg    = crime["change_pct"]
-        rvol   = crime["rvol"]
-        vel    = crime["velocity"]
-        rng    = crime["range_pct"]
-        prompt = (
-            f"A MEXC futures token just made a suspicious move:\n"
-            f"Symbol: {sym}\n"
-            f"24h change: {chg:+.1f}%\n"
-            f"Volume vs normal (RVOL): {rvol:.1f}x\n"
-            f"Price velocity (recent vs prior): {vel:.1f}x\n"
-            f"Daily range: {rng:.1f}% of price\n\n"
-            f"In 2-3 sentences: does this look like coordinated manipulation "
-            f"(pump/dump scheme)? What signals support or contradict that? "
-            f"What should a trader watch for next?"
-        )
-        return ask([
-            {"role": "system", "content":
-             "You are Scout, a market intelligence companion. Be direct and specific. "
-             "Do not hedge excessively. If it looks like manipulation, say so."},
-            {"role": "user", "content": prompt},
-        ], max_tokens=150)
+        from app.reasoning import explain_crime_move
+        return explain_crime_move(crime)
     except Exception as e:
         log.debug(f"_explain_crime failed: {e}")
         return ""
 
 
-def _explain_sweep(symbol: str, sweep: dict, bias_data: dict) -> str:
-    """Ask 0G Compute to explain a detected sweep."""
+def _explain_intel_alert(symbol: str, intel: dict) -> str:
+    """
+    Ask 0G Compute to explain a proactive alert based on full intelligence.
+    This is the key improvement — 0G gets FACTS, not raw candles.
+    """
     try:
         from app.zg_compute import ask
-        sym   = symbol.replace("USDT", "")
-        level = sweep.get("level", 0)
-        direction = sweep.get("direction", "")
-        desc  = sweep.get("description", "")
-        daily_bias = bias_data.get("daily_bias", "neutral")
-        h4_bias    = bias_data.get("h4_bias", "neutral")
-        prompt = (
-            f"A liquidity sweep was just detected on {sym} (H1 timeframe):\n"
-            f"{desc}\n"
-            f"HTF context: Daily bias = {daily_bias}, H4 bias = {h4_bias}\n\n"
-            f"In 2-3 sentences: what does this sweep mean for the next likely "
-            f"move? Is this a valid entry signal or a trap? What confirms or "
-            f"invalidates this setup?"
+        from app.intelligence import format_intelligence_for_model
+
+        context = format_intelligence_for_model(intel)
+        question = (
+            "A high-scoring SMC setup just formed. Based on this intelligence:\n"
+            "1. What exactly triggered this alert?\n"
+            "2. Is this a quality setup or noise?\n"
+            "3. What confirms or invalidates it?\n"
+            "Keep it under 100 words."
         )
+
+        from app.reasoning import SYSTEM_PROMPT
         return ask([
-            {"role": "system", "content":
-             "You are Scout, a market intelligence companion specializing in "
-             "Smart Money Concepts. Be specific about price levels and structure."},
-            {"role": "user", "content": prompt},
-        ], max_tokens=150)
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user",   "content": f"{context}\n\n{question}"},
+        ], max_tokens=160)
     except Exception as e:
-        log.debug(f"_explain_sweep failed: {e}")
+        log.debug(f"_explain_intel_alert failed: {e}")
         return ""
 
 
@@ -257,10 +220,6 @@ def run_mexc_crime_scan():
             rvol      = crime["rvol"]
             rng       = crime["range_pct"]
 
-            # ── MEXC funding rate — critical context for crime assessment ──
-            # Positive funding on a pump = longs paying heavily = reversal risk
-            # Negative funding on a dump = shorts paying = potential squeeze
-            # This is the data Binance can't give us for MEXC-only pairs
             funding_line = ""
             try:
                 fd = get_funding_rate(sym)
@@ -272,13 +231,13 @@ def run_mexc_crime_scan():
                     mins     = max(0, (next_ms - now_ms) // 60000) if next_ms else 999
 
                     if direction == "PUMP" and rate > 0.001:
-                        funding_line = f"⚠️ Funding: {rate_pct} (longs paying — reversal risk at settlement in {mins}min)"
+                        funding_line = f"⚠️ Funding: {rate_pct} (longs paying — reversal risk in {mins}min)"
                     elif direction == "PUMP" and rate < -0.0005:
-                        funding_line = f"🔥 Funding: {rate_pct} (shorts paying — fuel for continuation, settle {mins}min)"
+                        funding_line = f"🔥 Funding: {rate_pct} (shorts paying — fuel for continuation, {mins}min)"
                     elif direction == "DUMP" and rate < -0.001:
-                        funding_line = f"⚠️ Funding: {rate_pct} (shorts paying — squeeze risk at settlement in {mins}min)"
+                        funding_line = f"⚠️ Funding: {rate_pct} (shorts paying — squeeze risk in {mins}min)"
                     elif direction == "DUMP" and rate > 0.0005:
-                        funding_line = f"🔥 Funding: {rate_pct} (longs paying — fuel for dump, settle {mins}min)"
+                        funding_line = f"🔥 Funding: {rate_pct} (longs paying — fuel for dump, {mins}min)"
                     else:
                         funding_line = f"Funding: {rate_pct} (settle {mins}min)"
             except Exception as _fe:
@@ -290,7 +249,7 @@ def run_mexc_crime_scan():
                 f"{severity} — MEXC CRIME DETECTED",
                 f"",
                 f"Symbol: {sym.replace('_USDT', '')}/USDT",
-                f"Move: {chg:+.1f}%  ({direction})",
+                f"Move: {chg:+.2f}%  ({direction})",
                 f"Volume: {rvol:.1f}x normal",
                 f"Daily range: {rng:.1f}%",
                 f"Crime score: {score:.0f}",
@@ -304,7 +263,7 @@ def run_mexc_crime_scan():
             _send_alert("\n".join(msg_lines), alert_type="crime", symbol=sym)
             _mark_alerted(key)
             _persist_state()
-            log.info(f"scanner: crime alert sent for {sym} ({chg:+.1f}%)")
+            log.info(f"scanner: crime alert sent for {sym} ({chg:+.2f}%)")
 
     except Exception as e:
         log.error(f"scanner: MEXC crime scan error — {e}")
@@ -312,96 +271,119 @@ def run_mexc_crime_scan():
 
 def run_structure_scan():
     """
-    Default scan using the core SMC strategy:
-      Daily + H4 → bias
-      H1         → BOS confirmation (setup forming)
-      M15        → sweep + displacement entry signal
-
-    User custom monitors use their own TF stack.
+    Intelligence-driven structure scan.
+    Builds full intelligence for each symbol, scores it, alerts if score >= threshold.
     """
-    log.info("scanner: running structure scan (M15 entry | H1 confirm | H4+D bias)...")
+    log.info("scanner: running intelligence-driven structure scan...")
     try:
         from app.market_data import get_klines
-        from app.structure import (full_structure_snapshot, detect_bos,
-                                    get_htf_bias)
+        from app.mexc_data import get_funding_rate as mexc_funding
+        from app.intelligence import build_intelligence
 
         for symbol in STRUCTURE_WATCHLIST:
             try:
-                candles_m15   = get_klines(symbol, "15m", 96)
-                candles_h1    = get_klines(symbol, "1h",  50)
-                candles_h4    = get_klines(symbol, "4h",  50)
-                candles_daily = get_klines(symbol, "1d",  30)
+                c_m15   = get_klines(symbol, "15m", 96)
+                c_h1    = get_klines(symbol, "1h",  50)
+                c_h4    = get_klines(symbol, "4h",  50)
+                c_daily = get_klines(symbol, "1d",  30)
 
-                if not candles_m15 or not candles_h1:
+                if not c_h1:
                     continue
 
-                # HTF bias
-                bias_data = get_htf_bias(candles_daily, candles_h4)
-                bias      = bias_data["bias"]
+                funding_rate = 0.0
+                try:
+                    fd = mexc_funding(symbol)
+                    if fd.get("ok"):
+                        funding_rate = fd["funding_rate"]
+                except Exception:
+                    pass
 
-                # H1 BOS confirmation
-                h1_bos = detect_bos(candles_h1, lookback=48)
+                # Build full intelligence
+                intel = build_intelligence(
+                    symbol        = symbol,
+                    candles_m15   = c_m15,
+                    candles_h1    = c_h1,
+                    candles_h4    = c_h4,
+                    candles_daily = c_daily,
+                    funding_rate  = funding_rate,
+                )
 
-                # M15 sweep + displacement (entry signal)
-                snap_m15     = full_structure_snapshot(symbol, candles_m15, candles_h1, candles_h4)
-                sweep        = snap_m15.get("recent_sweep")
-                displacement = snap_m15.get("displacement", {})
-                order_block  = snap_m15.get("order_block", {})
-                inducements  = snap_m15.get("inducement_zones", [])
-                sym_short    = symbol.replace("USDT", "")
+                score     = intel.get("score", 0)
+                sym_short = symbol.replace("USDT", "")
+                sweep     = intel.get("sweep", {})
+                disp      = intel.get("displacement", {})
+                bos       = intel.get("bos", {})
+                bias      = intel.get("htf_bias", "Neutral")
+                regime    = intel.get("regime", "Unknown")
+                session   = intel.get("session", {})
+                ob        = intel.get("order_block", {})
+                fvg       = intel.get("fvg", {})
 
-                # ── M15 sweep alert ───────────────────────────────────────
-                if sweep and sweep.get("age_candles", 99) <= 3:
-                    sweep_time = sweep.get("open_time", "")[:16]
-                    key = f"sweep_{symbol}_{round(sweep['level'], 2)}_{sweep_time}"
-                    if _is_cooled_down(key, SWEEP_COOLDOWN):
-                        explanation = _explain_sweep(symbol, sweep, bias_data)
+                # ── Sweep alert (high score + recent sweep) ────────────────
+                if sweep.get("detected") and sweep.get("age_candles", 99) <= 3:
+                    sweep_key = f"sweep_{symbol}_{round(sweep.get('level', 0), 2)}"
+                    if _is_cooled_down(sweep_key, SWEEP_COOLDOWN):
+                        explanation = _explain_intel_alert(symbol, intel) if score >= PROACTIVE_ALERT_SCORE else ""
+
                         msg_lines = [
-                            f"🎯 M15 SWEEP — {sym_short}",
+                            f"🎯 M15/H1 SWEEP — {sym_short}",
                             f"",
-                            f"{sweep['description']}",
-                            f"H4 Bias: {bias.upper()}",
-                            f"H1 BOS: {'✅ ' + h1_bos.get('bias','').upper() if h1_bos.get('broken') else '⏳ Not confirmed yet'}",
-                            f"Alignment: {'✅ FULL — all TFs aligned' if h1_bos.get('broken') and h1_bos.get('bias') == bias else '⚠️ Watch H1 for BOS confirmation'}",
+                            f"{sweep.get('description', '')}",
+                            f"Score: {score}/100  |  Regime: {regime}",
+                            f"HTF Bias: {bias}",
                         ]
-                        if displacement.get("confirmed"):
-                            msg_lines.append(f"✅ {displacement['description']}")
-                            if order_block.get("found"):
-                                msg_lines.append(f"📦 OB: {order_block['low']:.4f}–{order_block['high']:.4f}")
+
+                        if disp.get("confirmed"):
+                            msg_lines.append(f"✅ {disp.get('description', 'Displacement confirmed')}")
                         else:
-                            msg_lines.append("⚠️ No displacement yet — wait for confirmation")
-                        for z in inducements[:2]:
-                            msg_lines.append(f"  • {z['price']:.4f} ({z['distance_pct']:+.1f}%) — {z['note']}")
+                            msg_lines.append("⏳ No displacement yet — wait for confirmation")
+
+                        if bos.get("broken"):
+                            msg_lines.append(f"⚡ BOS: {bos.get('description', '')}")
+
+                        if ob.get("found"):
+                            msg_lines.append(f"📦 OB: {ob['low']:.4f}–{ob['high']:.4f}")
+
+                        if fvg.get("found"):
+                            msg_lines.append(f"📊 FVG: {fvg['low']:.4f}–{fvg['high']:.4f}")
+
+                        if session.get("in_killzone"):
+                            msg_lines.append(f"⏰ {session.get('description', '')}")
+
+                        intel_fund = intel.get("funding", {})
+                        if intel_fund.get("note"):
+                            msg_lines.append(f"💰 {intel_fund['note']}")
+
                         if explanation:
                             msg_lines += ["", explanation]
+
                         msg_lines.append(f"\n{datetime.now(timezone.utc).strftime('%H:%M UTC')}")
                         _send_alert("\n".join(msg_lines), alert_type="sweep", symbol=symbol)
-                        _mark_alerted(key)
+                        _mark_alerted(sweep_key)
                         _persist_state()
-                        log.info(f"scanner: M15 sweep alert — {symbol}")
+                        log.info(f"scanner: sweep alert — {symbol} (score {score})")
 
-                # ── H1 BOS alert (setup forming, watch M15) ───────────────
-                if h1_bos.get("broken") and h1_bos.get("candle_idx", 0) >= len(candles_h1) - 2:
-                    bos_bias = h1_bos.get("bias", "")
-                    bos_time = h1_bos.get("open_time", "")[:16]
-                    key = f"bos_{symbol}_{round(h1_bos.get('level', 0), 2)}_{bos_bias}_{bos_time}"
-                    if _is_cooled_down(key, BOS_COOLDOWN):
-                        alignment = "✅ WITH H4 bias" if bos_bias == bias else "⚠️ AGAINST H4 bias"
+                # ── BOS alert ────────────────────────────────────────────────
+                if bos.get("broken") and not sweep.get("detected"):
+                    bos_key = f"bos_{symbol}_{round(bos.get('level', 0), 2)}_{bos.get('bias','')}"
+                    if _is_cooled_down(bos_key, BOS_COOLDOWN):
                         msg_lines = [
                             f"⚡ H1 BOS — {sym_short}",
                             f"",
-                            f"{h1_bos.get('description', '')}",
-                            f"H4 Bias: {bias.upper()}  |  {alignment}",
+                            f"{bos.get('description', '')}",
+                            f"Regime: {regime}  |  Score: {score}/100",
+                            f"HTF Bias: {bias}",
                             f"👀 Watch M15 for sweep + displacement entry",
                         ]
-                        if inducements:
-                            z = inducements[0]
+                        indu = intel.get("inducements", [])
+                        if indu:
+                            z = indu[0]
                             msg_lines.append(f"Next inducement: {z['price']:.4f} ({z['distance_pct']:+.1f}%)")
                         msg_lines.append(f"\n{datetime.now(timezone.utc).strftime('%H:%M UTC')}")
                         _send_alert("\n".join(msg_lines), alert_type="bos", symbol=symbol)
-                        _mark_alerted(key)
+                        _mark_alerted(bos_key)
                         _persist_state()
-                        log.info(f"scanner: H1 BOS alert — {symbol}")
+                        log.info(f"scanner: BOS alert — {symbol}")
 
             except Exception as e:
                 log.debug(f"scanner: structure scan error for {symbol} — {e}")
@@ -411,6 +393,78 @@ def run_structure_scan():
         log.error(f"scanner: structure scan error — {e}")
 
 
+def run_opportunity_ranking():
+    """
+    Periodically rank all watchlist symbols by opportunity score.
+    If the top symbol exceeds the proactive threshold, send an alert.
+    This is Phase 7 — opportunity ranking.
+    """
+    log.info("scanner: running opportunity ranking...")
+    try:
+        from app.market_data import get_klines
+        from app.mexc_data import get_funding_rate as mexc_funding
+        from app.intelligence import rank_opportunities
+
+        candles_map = {}
+        funding_map = {}
+
+        for sym in STRUCTURE_WATCHLIST:
+            try:
+                candles_map[sym] = {
+                    "m15":   get_klines(sym, "15m", 96),
+                    "h1":    get_klines(sym, "1h",  50),
+                    "h4":    get_klines(sym, "4h",  50),
+                    "daily": get_klines(sym, "1d",  30),
+                }
+                fd = mexc_funding(sym)
+                if fd.get("ok"):
+                    funding_map[sym] = fd["funding_rate"]
+            except Exception:
+                pass
+
+        top = rank_opportunities(STRUCTURE_WATCHLIST, candles_map, funding_map, top_n=3)
+        if not top:
+            return
+
+        best = top[0]
+        score = best["score"]
+
+        if score < PROACTIVE_ALERT_SCORE:
+            log.info(f"scanner: top opportunity {best['symbol']} score {score} below threshold")
+            return
+
+        key = f"ranking_{best['symbol']}_{score // 10 * 10}"
+        if not _is_cooled_down(key, 3600):  # max once per hour per score band
+            return
+
+        # Build ranking message
+        lines = ["🏆 <b>OPPORTUNITY RANKING UPDATE</b>\n"]
+        for i, intel in enumerate(top, 1):
+            sym    = intel["symbol"].replace("USDT", "")
+            sc     = intel["score"]
+            bias   = intel["htf_bias"]
+            regime = intel["regime"]
+            bar    = "🟢" if sc >= 75 else "🟡" if sc >= 50 else "🔴"
+            sigs   = []
+            if intel.get("sweep", {}).get("detected"):
+                sigs.append("sweep")
+            if intel.get("displacement", {}).get("confirmed"):
+                sigs.append("disp")
+            if intel.get("bos", {}).get("broken"):
+                sigs.append("BOS")
+            sig_str = "+".join(sigs) if sigs else "monitoring"
+            lines.append(f"{bar} {i}. <b>{sym}</b>  {sc}/100  ({bias} | {regime}) — {sig_str}")
+
+        lines.append(f"\n{datetime.now(timezone.utc).strftime('%H:%M UTC')}")
+        _send_alert("\n".join(lines), alert_type="ranking", symbol=best["symbol"])
+        _mark_alerted(key)
+        _persist_state()
+        log.info(f"scanner: opportunity ranking alert sent — top: {best['symbol']} {score}/100")
+
+    except Exception as e:
+        log.error(f"scanner: opportunity ranking error — {e}")
+
+
 def _mexc_loop():
     while _running:
         run_mexc_crime_scan()
@@ -418,21 +472,26 @@ def _mexc_loop():
 
 
 def _structure_loop():
-    # Stagger by 60s so both loops don't fire at the same time on startup
     time.sleep(60)
+    scan_count = 0
     while _running:
         run_structure_scan()
         _run_user_watchlist_scan()
+        scan_count += 1
+        # Run opportunity ranking every 3rd structure scan (~30 min)
+        if scan_count % 3 == 0:
+            run_opportunity_ranking()
         time.sleep(STRUCTURE_SCAN_INTERVAL)
 
 
 def _run_user_watchlist_scan():
-    """Scan each user's personal watchlist using their configured TF stack."""
+    """Scan each user's personal watchlist using the Intelligence Engine."""
     if not _user_watchlists:
         return
     try:
         from app.market_data import get_klines
-        from app.structure import full_structure_snapshot, detect_bos, get_htf_bias
+        from app.mexc_data import get_funding_rate as mexc_funding
+        from app.intelligence import build_intelligence
 
         for chat_id, watches in _user_watchlists.items():
             for watch in watches:
@@ -443,47 +502,57 @@ def _run_user_watchlist_scan():
                 bias_tf    = watch.get("bias_tf",    "4h")
 
                 try:
-                    candles_entry   = get_klines(symbol, entry_tf,   96)
-                    candles_confirm = get_klines(symbol, confirm_tf, 50)
-                    candles_bias    = get_klines(symbol, bias_tf,    50)
-                    candles_daily   = get_klines(symbol, "1d",       30)
+                    c_entry   = get_klines(symbol, entry_tf,   96)
+                    c_confirm = get_klines(symbol, confirm_tf, 50)
+                    c_bias    = get_klines(symbol, bias_tf,    50)
+                    c_daily   = get_klines(symbol, "1d",       30)
 
-                    if not candles_entry:
+                    if not c_entry:
                         continue
 
-                    bias_data   = get_htf_bias(candles_daily, candles_bias)
-                    bias        = bias_data["bias"]
-                    confirm_bos = detect_bos(candles_confirm, lookback=48)
-                    snap        = full_structure_snapshot(symbol, candles_entry, candles_confirm, candles_bias)
-                    sweep        = snap.get("recent_sweep")
-                    displacement = snap.get("displacement", {})
-                    order_block  = snap.get("order_block", {})
-                    indu         = snap.get("inducement_zones", [])
-                    sym_short    = symbol.replace("USDT", "").replace("_USDT", "")
-                    tf_label     = f"{entry_tf.upper()} entry | {confirm_tf.upper()} confirm | {bias_tf.upper()} bias"
+                    funding_rate = 0.0
+                    try:
+                        fd = mexc_funding(symbol)
+                        if fd.get("ok"):
+                            funding_rate = fd["funding_rate"]
+                    except Exception:
+                        pass
 
-                    if "sweep" in conds and sweep and sweep.get("age_candles", 99) <= 3:
-                        sweep_time = sweep.get("open_time", "")[:16]
-                        key = f"user_{chat_id}_sweep_{symbol}_{round(sweep['level'], 2)}_{sweep_time}"
+                    intel     = build_intelligence(
+                        symbol        = symbol,
+                        candles_m15   = c_entry if entry_tf in ("15m", "5m") else [],
+                        candles_h1    = c_confirm,
+                        candles_h4    = c_bias,
+                        candles_daily = c_daily,
+                        funding_rate  = funding_rate,
+                    )
+
+                    score     = intel.get("score", 0)
+                    sym_short = symbol.replace("USDT", "").replace("_USDT", "")
+                    sweep     = intel.get("sweep", {})
+                    bos       = intel.get("bos", {})
+                    disp      = intel.get("displacement", {})
+                    bias      = intel.get("htf_bias", "Neutral")
+                    ob        = intel.get("order_block", {})
+
+                    if "sweep" in conds and sweep.get("detected") and sweep.get("age_candles", 99) <= 3:
+                        key = f"user_{chat_id}_sweep_{symbol}_{round(sweep.get('level', 0), 2)}"
                         if _is_cooled_down(key, SWEEP_COOLDOWN):
-                            explanation = _explain_sweep(symbol, sweep, bias_data)
+                            explanation = _explain_intel_alert(symbol, intel) if score >= 50 else ""
+                            tf_label = f"{entry_tf.upper()} entry | {confirm_tf.upper()} | {bias_tf.upper()} bias"
                             msg_lines = [
-                                f"🎯 <b>YOUR WATCHLIST — {sym_short} {entry_tf.upper()} SWEEP</b>",
+                                f"🎯 <b>YOUR WATCHLIST — {sym_short} SWEEP</b>",
                                 f"",
-                                f"{sweep['description']}",
-                                f"Bias ({bias_tf.upper()}): <b>{bias.upper()}</b>",
-                                f"BOS ({confirm_tf.upper()}): {'✅ ' + confirm_bos.get('bias','').upper() if confirm_bos.get('broken') else '⏳ Not confirmed'}",
-                                f"TF Stack: {tf_label}",
+                                f"{sweep.get('description', '')}",
+                                f"Score: {score}/100  |  Bias: <b>{bias}</b>",
+                                f"TF stack: {tf_label}",
                             ]
-                            if displacement.get("confirmed"):
-                                msg_lines.append(f"✅ {displacement['description']}")
-                                if order_block.get("found"):
-                                    msg_lines.append(f"📦 OB: {order_block['low']:.4f}–{order_block['high']:.4f}")
+                            if disp.get("confirmed"):
+                                msg_lines.append(f"✅ {disp.get('description', '')}")
+                                if ob.get("found"):
+                                    msg_lines.append(f"📦 OB: {ob['low']:.4f}–{ob['high']:.4f}")
                             else:
-                                msg_lines.append("⚠️ No displacement yet")
-                            if indu:
-                                z = indu[0]
-                                msg_lines.append(f"Next inducement: {z['price']:.4f} ({z['distance_pct']:+.1f}%)")
+                                msg_lines.append("⏳ No displacement yet")
                             if explanation:
                                 msg_lines += ["", explanation]
                             if watch.get("note"):
@@ -494,20 +563,17 @@ def _run_user_watchlist_scan():
                             _mark_alerted(key)
                             _persist_state()
 
-                    if "bos" in conds and confirm_bos.get("broken") and \
-                            confirm_bos.get("candle_idx", 0) >= len(candles_confirm) - 2:
-                        bos_bias = confirm_bos.get("bias", "")
-                        bos_time = confirm_bos.get("open_time", "")[:16]
-                        key = f"user_{chat_id}_bos_{symbol}_{round(confirm_bos.get('level',0),2)}_{bos_bias}_{bos_time}"
-                        if _is_cooled_down(key, BOS_COOLDOWN):
-                            alignment = "✅ WITH bias" if bos_bias == bias else "⚠️ AGAINST bias"
+                    if "bos" in conds and bos.get("broken"):
+                        bos_key = f"user_{chat_id}_bos_{symbol}_{round(bos.get('level', 0), 2)}"
+                        if _is_cooled_down(bos_key, BOS_COOLDOWN):
                             msg_lines = [
-                                f"⚡ <b>YOUR WATCHLIST — {sym_short} {confirm_tf.upper()} BOS</b>",
+                                f"⚡ <b>YOUR WATCHLIST — {sym_short} BOS</b>",
                                 f"",
-                                f"{confirm_bos.get('description', '')}",
-                                f"Bias ({bias_tf.upper()}): <b>{bias.upper()}</b>  |  {alignment}",
+                                f"{bos.get('description', '')}",
+                                f"Score: {score}/100  |  Bias: <b>{bias}</b>",
                                 f"👀 Watch {entry_tf.upper()} for entry sweep",
                             ]
+                            indu = intel.get("inducements", [])
                             if indu:
                                 z = indu[0]
                                 msg_lines.append(f"Next inducement: {z['price']:.4f} ({z['distance_pct']:+.1f}%)")
@@ -516,9 +582,10 @@ def _run_user_watchlist_scan():
                             msg_lines.append(f"\n{datetime.now(timezone.utc).strftime('%H:%M UTC')}")
                             if _send_fn:
                                 _send_fn(chat_id, "\n".join(msg_lines))
-                            _mark_alerted(key)
+                            _mark_alerted(bos_key)
                             _persist_state()
 
+                    # Funding monitors
                     funding_conds = [c for c in conds if c.startswith("funding")]
                     if funding_conds:
                         try:
@@ -529,7 +596,7 @@ def _run_user_watchlist_scan():
                                 next_ms = fd.get("next_settle_time", 0)
                                 now_ms  = int(time.time() * 1000)
                                 mins    = max(0, (next_ms - now_ms) // 60000) if next_ms else 999
-                                fire = False
+                                fire     = False
                                 rate_desc = ""
                                 if "funding_negative" in funding_conds and rate < 0:
                                     fire = True
@@ -565,24 +632,17 @@ def _run_user_watchlist_scan():
 
 
 def start_scanner(send_fn, chat_id: int):
-    """
-    Start the background scanner threads.
-    Restores prior state from 0G Storage on startup.
-    """
     global _send_fn, _chat_id, _running, _alert_cooldowns, _user_watchlists
 
     _send_fn = send_fn
     _chat_id = chat_id
 
-    # ── Restore state from 0G Storage ────────────────────────────────────
-    # This is what makes Scout's memory survive restarts and deploys.
-    # Cooldowns, watchlists, and alert history are all persisted on 0G.
     try:
         from app.zg_storage import load_state
         prior = load_state()
         if prior:
-            _alert_cooldowns  = prior.get("cooldowns",   {})
-            _user_watchlists  = prior.get("watchlists",  {})
+            _alert_cooldowns = prior.get("cooldowns",   {})
+            _user_watchlists = prior.get("watchlists",  {})
             log.info(
                 f"scanner: restored from 0G Storage — "
                 f"{len(_alert_cooldowns)} cooldowns, "
@@ -591,7 +651,7 @@ def start_scanner(send_fn, chat_id: int):
         else:
             log.info("scanner: no prior 0G Storage state — starting fresh")
     except Exception as e:
-        log.warning(f"scanner: state restore failed — {e} — starting fresh")
+        log.warning(f"scanner: state restore failed — {e}")
 
     _running = True
     t1 = threading.Thread(target=_mexc_loop,      daemon=True, name="mexc-scanner")
