@@ -1,24 +1,16 @@
 """
-reasoning.py — Scout's reasoning layer.
+reasoning.py — Scout's reasoning and intent routing layer.
 
-Architecture (updated):
-  Market Data
-  ↓
-  Intelligence Engine (intelligence.py) — extracts FACTS
-  ↓
-  0G Compute — explains facts, evidence-based
-  ↓
-  Telegram response
+Scout Master Roadmap implementations:
+  P2:  Monitoring ≠ Analysis — separate code paths, never conflated
+  P3:  Full trade setups — every analysis output includes entry/SL/TP1/TP2/RR/confluence
+  P8:  Trend continuation vs trend change classification in text output
+  P12: Proactive opportunity discovery in route_message
+  P13: Auto setup generation — best_opportunities() returns ranked setups with full plans
+  P14: Rich alert quality — structured output, no bare event names
 
-The model no longer guesses. It receives structured intelligence and
-explains what the data actually shows.
-
-Evidence-Based Prompt Format:
-  1. Market Condition
-  2. Evidence
-  3. Risks
-  4. Opportunity
-  5. Confidence
+The model only explains what the intelligence engine has already proven.
+It does NOT invent price levels, conditions, or directional bias.
 """
 
 import logging
@@ -32,71 +24,98 @@ from app.intelligence import (
 
 log = logging.getLogger("scout")
 
+# ── System prompt ─────────────────────────────────────────────────────────
+
 SYSTEM_PROMPT = (
-    "You are Scout, an AI market intelligence companion for a professional crypto trader. "
-    "You reason using Smart Money Concepts (SMC).\n\n"
+    "You are Scout, a personal SMC trading assistant for a professional crypto trader. "
+    "You reason exclusively using Smart Money Concepts (SMC).\n\n"
 
-    "CRITICAL RULE: Only use the supplied market intelligence data. "
-    "Do not invent price levels, percentages, or conditions not in the data. "
-    "Do not make assumptions. If a data point is missing, say so.\n\n"
+    "ABSOLUTE RULE: Only use supplied market intelligence data. "
+    "NEVER invent price levels, percentages, regimes, or conditions not in the data. "
+    "If data is missing, say so explicitly.\n\n"
 
-    "RESPONSE FORMAT — always structure your answer as:\n"
-    "1. MARKET CONDITION: What regime and bias the market is in right now\n"
-    "2. EVIDENCE: Specific facts from the intelligence data (sweep, displacement, BOS, etc)\n"
-    "3. RISKS: What could invalidate this read\n"
-    "4. OPPORTUNITY: Is there a trade setup? Entry zone, target, invalidation level\n"
-    "5. CONFIDENCE: Low/Medium/High — based on how many confluence factors are present\n\n"
+    "TRADE SETUP FORMAT — every analysis must include:\n"
+    "Bias: [bullish/bearish]\n"
+    "Entry: [price zone low – high]\n"
+    "SL: [level]\n"
+    "TP1: [level]\n"
+    "TP2: [level]\n"
+    "RR: 1:[ratio]\n"
+    "Confluence:\n"
+    "  ✓ [specific evidence from data]\n"
+    "  ✓ [specific evidence from data]\n"
+    "Confidence: [Low/Medium/High]\n\n"
 
-    "KEY SMC CONCEPTS:\n"
-    "- Liquidity sweep: price wicks into a prior swing H/L (stop hunt), then rejects. "
-    "Bullish sweep = hunts lows then closes back above. "
-    "Bearish sweep = hunts highs then closes back below.\n"
-    "- Displacement: strong impulsive candle AFTER a sweep (body ≥55% of range). "
-    "Confirms the sweep was engineered.\n"
-    "- BOS: price closes beyond a prior swing. Confirms structure shift.\n"
-    "- Order Block (OB): last opposing candle before displacement. Entry zone.\n"
-    "- FVG: 3-candle imbalance. Price tends to fill these.\n"
-    "- Inducement: equal H/L just ahead of price — the trap before the real move.\n"
-    "- Kill zones: London (08:00–11:00 UTC) and New York (13:00–16:00 UTC).\n"
-    "- Regime: Expansion (trending), Compression (ranging), Exhaustion (reversal pending).\n\n"
+    "If no setup exists: state the bias, what's missing, and what condition "
+    "would trigger a valid setup.\n\n"
 
-    "Be specific about price levels from the data. Under 200 words unless asked for more. "
-    "Never say 'it could go up or down' without giving a directional lean with reasoning."
+    "CLASSIFICATION — always label moves as:\n"
+    "  Bullish/Bearish Continuation — same direction as bias\n"
+    "  Trend Change — bias has shifted\n"
+    "  Range — compression, no directional edge\n"
+    "  No Trade — conditions not met\n\n"
+
+    "SMC CONCEPTS:\n"
+    "- Liquidity sweep: wicks into prior swing H/L then rejects\n"
+    "- Displacement: impulsive candle after sweep (body ≥55% of range)\n"
+    "- BOS: close beyond prior swing — confirms structure shift\n"
+    "- Order Block (OB): last opposing candle before displacement — entry zone\n"
+    "- FVG: 3-candle imbalance — price fills these\n"
+    "- Inducement: equal H/L ahead of price — the trap before the real move\n"
+    "- Kill zones: London 08:00–11:00 UTC, New York 13:00–16:00 UTC\n"
+    "- Regime: Expansion (trending), Compression (ranging), Exhaustion (reversal)\n\n"
+
+    "Be direct. Under 200 words unless asked for more. "
+    "Never say 'it could go either way' without a directional lean and specific reasoning."
+)
+
+# Tighter prompt for setup generation — forces structured output
+SETUP_SYSTEM_PROMPT = (
+    "You are Scout. Generate structured trade setups from SMC intelligence data.\n\n"
+    "For EACH symbol output EXACTLY this format:\n\n"
+    "[SYMBOL] [DIRECTION]\n"
+    "Bias: [bullish/bearish]\n"
+    "Entry: [low] – [high]\n"
+    "SL: [level]\n"
+    "TP1: [level]  (RR 1:[x])\n"
+    "TP2: [level]  (RR 1:[x])\n"
+    "Confluence:\n"
+    "  ✓ [fact from data]\n"
+    "  ✓ [fact from data]\n"
+    "Confidence: [Low/Medium/High]\n\n"
+    "RULES:\n"
+    "- Only use levels from the intelligence data\n"
+    "- No invented numbers\n"
+    "- If no setup: write 'No Setup — [reason]'\n"
+    "- No commentary outside the format\n"
+    "- Classify as: Continuation / Trend Change / Range / No Trade"
 )
 
 
-def explain_symbol(symbol: str, user_question: str = "") -> str:
-    """
-    Fetch full intelligence for a symbol and ask 0G Compute to explain it.
-    This is the primary path for 'What's happening with BTC?'
-    """
+# ── Core intelligence fetch helper ────────────────────────────────────────
+
+def _fetch_intel(symbol: str) -> dict:
+    """Fetch full multi-TF intelligence for a symbol."""
     from app.market_data import get_klines
     from app.mexc_data import get_funding_rate as mexc_funding
 
-    # Fetch candles at all TFs
-    try:
-        c_m15   = get_klines(symbol, "15m", 96)
-        c_h1    = get_klines(symbol, "1h",  50)
-        c_h4    = get_klines(symbol, "4h",  50)
-        c_daily = get_klines(symbol, "1d",  30)
-    except Exception as e:
-        return f"⚠️ Couldn't fetch market data for {symbol}: {e}"
+    c_m15   = get_klines(symbol, "15m", 96)
+    c_h1    = get_klines(symbol, "1h",  50)
+    c_h4    = get_klines(symbol, "4h",  50)
+    c_daily = get_klines(symbol, "1d",  30)
 
-    # Funding
     funding_rate = 0.0
     try:
         fd = mexc_funding(symbol)
         if fd.get("ok"):
             funding_rate = fd["funding_rate"]
         else:
-            # Binance fallback
             fd2 = market_data.get_funding_rate(symbol)
             funding_rate = fd2.get("funding_rate", 0.0)
     except Exception:
         pass
 
-    # Build intelligence
-    intel = build_intelligence(
+    return build_intelligence(
         symbol        = symbol,
         candles_m15   = c_m15,
         candles_h1    = c_h1,
@@ -105,79 +124,109 @@ def explain_symbol(symbol: str, user_question: str = "") -> str:
         funding_rate  = funding_rate,
     )
 
-    context  = format_intelligence_for_model(intel)
+
+# ── explain_symbol — P3: always includes full trade setup ─────────────────
+
+def explain_symbol(symbol: str, user_question: str = "") -> str:
+    """
+    Fetch full intelligence for a symbol and produce a complete SMC analysis.
+    P3: output always includes entry / SL / TP1 / TP2 / RR / confluence.
+    P8: classifies as continuation or trend change, not bare events.
+    """
+    try:
+        intel = _fetch_intel(symbol)
+    except Exception as e:
+        return f"⚠️ Couldn't fetch market data for {symbol}: {e}"
+
+    # Attach deterministic trade plan levels (P4)
+    plan_context = ""
+    try:
+        from app.trade_plan import generate_trade_plan, format_trade_plan
+        plan = generate_trade_plan(intel)
+        if not plan.get("error"):
+            plan_context = f"\n\nDETERMINISTIC TRADE PLAN (from market structure):\n{format_trade_plan(plan)}"
+    except Exception:
+        pass
+
+    context  = format_intelligence_for_model(intel) + plan_context
     question = user_question or (
-        f"Based on this intelligence data, what is the current market condition "
-        f"for {symbol.replace('USDT','')} and is there a trade setup forming?"
+        f"Provide a complete SMC analysis for {symbol.replace('USDT','')}. "
+        f"State the bias, classify the move (continuation/trend change/range/no trade), "
+        f"and give a full trade setup with entry, SL, TP1, TP2, and RR. "
+        f"Use only the intelligence data — no invented levels."
     )
 
     try:
         return ask([
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user",   "content": f"{context}\n\nQuestion: {question}"},
-        ], max_tokens=400)
+        ], max_tokens=450)
     except ZGComputeError as e:
         log.error(f"explain_symbol({symbol}) failed: {e}")
         return f"⚠️ Couldn't reach 0G Compute ({e}).\n\nRaw intelligence:\n{context}"
 
 
+# ── explain_structure — /bias command ─────────────────────────────────────
+
 def explain_structure(symbol: str) -> str:
     """
-    '/bias BTC' — full SMC structure picture with intelligence engine.
+    /bias command — full SMC structure picture.
+    P3/P8: includes classification + full trade setup output.
     """
-    from app.market_data import get_klines
-    from app.mexc_data import get_funding_rate as mexc_funding
-
     try:
-        c_m15   = get_klines(symbol, "15m", 96)
-        c_h1    = get_klines(symbol, "1h",  50)
-        c_h4    = get_klines(symbol, "4h",  50)
-        c_daily = get_klines(symbol, "1d",  30)
+        intel = _fetch_intel(symbol)
     except Exception as e:
         return f"⚠️ Couldn't fetch data for {symbol}: {e}"
 
-    funding_rate = 0.0
+    # Attach deterministic plan
+    plan_section = ""
     try:
-        fd = mexc_funding(symbol)
-        if fd.get("ok"):
-            funding_rate = fd["funding_rate"]
+        from app.trade_plan import generate_trade_plan, format_trade_plan
+        plan = generate_trade_plan(intel)
+        if not plan.get("error"):
+            plan_section = (
+                f"\n\nDETERMINISTIC PLAN (derived from structure):\n"
+                f"{format_trade_plan(plan)}"
+            )
     except Exception:
         pass
 
-    intel   = build_intelligence(symbol, c_m15, c_h1, c_h4, c_daily, funding_rate)
-    context = format_intelligence_for_model(intel)
-
+    context  = format_intelligence_for_model(intel) + plan_section
     question = (
-        "Based on this intelligence data, provide:\n"
-        "1. The overall bias and regime — and why\n"
-        "2. What the sweep/BOS evidence means for next move\n"
-        "3. Key levels to watch (OB, FVG, inducement zones)\n"
-        "4. What specifically confirms or invalidates a trade setup\n"
-        "Keep it under 200 words."
+        "Provide a complete SMC structure analysis:\n"
+        "1. Overall bias and regime classification\n"
+        "   (Bullish/Bearish Trend, Continuation, Trend Change, Range, No Trade)\n"
+        "2. What the sweep/displacement/BOS evidence means for next move\n"
+        "3. Key levels: OB zone, FVG, inducement\n"
+        "4. Full trade setup (entry zone, SL, TP1, TP2, RR, confluence)\n"
+        "5. What specifically confirms or invalidates the setup\n"
+        "Use only data provided. Under 250 words."
     )
 
     try:
         return ask([
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user",   "content": f"{context}\n\n{question}"},
-        ], max_tokens=400)
+        ], max_tokens=500)
     except ZGComputeError as e:
         return f"Structure intelligence:\n{context}\n\n⚠️ 0G Compute unavailable: {e}"
 
 
+# ── best_opportunities — P13: auto-ranked setups with full plans ──────────
+
 def best_opportunities(symbols: list = None, top_n: int = 5) -> str:
     """
-    Rank all watchlist symbols by opportunity score, then ask 0G Compute
-    to explain the top setups. Uses the intelligence engine for proper scoring.
+    P13: Rank all watchlist symbols, generate full trade plans for top results.
+    Output: ranked header + full setup for each (entry/SL/TP1/TP2/RR/confluence).
+    P14: Rich output — no bare event names, always actionable.
     """
     from app.market_data import get_klines, DEFAULT_WATCHLIST
     from app.mexc_data import get_funding_rate as mexc_funding
+    from app.trade_plan import generate_trade_plan, format_trade_plan
 
-    symbols = symbols or DEFAULT_WATCHLIST
-
-    # Build candle map for all symbols
-    candles_map  = {}
-    funding_map  = {}
+    symbols     = symbols or DEFAULT_WATCHLIST
+    candles_map = {}
+    funding_map = {}
 
     for sym in symbols:
         try:
@@ -197,118 +246,179 @@ def best_opportunities(symbols: list = None, top_n: int = 5) -> str:
         except Exception:
             pass
 
-    # Rank
     top = rank_opportunities(symbols, candles_map, funding_map, top_n=top_n)
 
     if not top:
         return (
-            "No setups with confirmed structure across the watchlist right now.\n"
+            "No confirmed structure setups across the watchlist right now.\n"
             "Scanner checks every 10 minutes — you'll get an alert when one forms."
         )
 
-    # Build ranking header
-    header_lines = ["<b>🏆 Opportunity Ranking</b>\n"]
+    # ── Ranking header ────────────────────────────────────────────────────
+    ICONS = {"🟢": 75, "🟡": 50}
+    header_lines = ["<b>🏆 Setup Ranking</b>\n"]
     for i, intel in enumerate(top, 1):
-        sym   = intel["symbol"].replace("USDT", "")
-        score = intel["score"]
-        bias  = intel["htf_bias"]
+        sym    = intel["symbol"].replace("USDT", "")
+        score  = intel["score"]
+        bias   = intel["htf_bias"]
         regime = intel["regime"]
+        icon   = "🟢" if score >= 75 else "🟡" if score >= 50 else "🔴"
 
-        # Score indicator
-        if score >= 75:
-            bar = "🟢"
-        elif score >= 50:
-            bar = "🟡"
-        else:
-            bar = "🔴"
-
-        # One-line summary of key signals
-        signals = []
+        sigs = []
         if intel.get("sweep", {}).get("detected"):
-            signals.append("sweep")
+            sigs.append("sweep")
         if intel.get("displacement", {}).get("confirmed"):
-            signals.append("displacement")
+            sigs.append("disp")
         if intel.get("bos", {}).get("broken"):
-            signals.append("BOS")
-        sig_str = " + ".join(signals) if signals else "no structure yet"
+            sigs.append("BOS")
+        if intel.get("order_block", {}).get("found"):
+            sigs.append("OB")
+        sig_str = " + ".join(sigs) if sigs else "monitoring"
 
         header_lines.append(
-            f"{bar} {i}. <b>{sym}</b>  Score: {score}/100  "
-            f"({bias} | {regime})\n"
-            f"   <i>{sig_str}</i>"
+            f"{icon} {i}. <b>{sym}</b>  {score}/100  ({bias} | {regime})\n"
+            f"   {sig_str}"
         )
 
     header = "\n".join(header_lines)
 
-    # Build context for 0G Compute — give it the intelligence for each
-    blocks = []
+    # ── Full trade plans for each top symbol ──────────────────────────────
+    plan_blocks = []
     for intel in top:
-        blocks.append(format_intelligence_for_model(intel))
+        sym_short = intel["symbol"].replace("USDT", "")
+        plan      = generate_trade_plan(intel)
+        if plan.get("error"):
+            plan_blocks.append(f"<b>{sym_short}</b>: No trade plan — {plan['error']}")
+        else:
+            plan_blocks.append(format_trade_plan(plan))
 
-    context  = "\n\n---\n\n".join(blocks)
+    plans_text = "\n\n".join(plan_blocks)
+
+    # ── 0G Compute context explanation ────────────────────────────────────
+    intel_blocks = [format_intelligence_for_model(i) for i in top]
+    context = "\n\n---\n\n".join(intel_blocks)
+
     question = (
-        "These are the top-ranked SMC opportunities right now, sorted by score. "
-        "For each symbol, give a 2-sentence read: "
-        "what the evidence shows and whether it's worth watching. "
-        "Be specific about levels. Reference the intelligence data — do not guess."
+        "These are the top-ranked SMC opportunities right now. "
+        "For each symbol, give ONE sentence explaining WHY it ranks here — "
+        "what specific evidence makes it notable. "
+        "Reference only the intelligence data provided. "
+        "No general commentary. No invented levels."
     )
 
     try:
         explanation = ask([
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user",   "content": f"{context}\n\n{question}"},
-        ], max_tokens=600)
-        return f"{header}\n\n{explanation}"
+        ], max_tokens=400)
+        return f"{header}\n\n{plans_text}\n\n{explanation}"
     except ZGComputeError as e:
-        return f"{header}\n\n⚠️ 0G Compute unavailable: {e}"
+        return f"{header}\n\n{plans_text}\n\n⚠️ 0G Compute unavailable: {e}"
 
+
+# ── explain_crime_move — P14: rich context on MEXC movers ────────────────
 
 def explain_crime_move(mover: dict) -> str:
-    """Ask 0G Compute to explain a suspicious MEXC mover."""
+    """
+    Ask 0G Compute to explain a suspicious MEXC mover.
+    P14: output is actionable — continuation/reversal/trap classification.
+    """
     try:
         sym   = mover["symbol"].replace("_USDT", "")
         chg   = mover["change_pct"]
-        vol   = mover.get("volume_24h", 0)
         rvol  = mover.get("rvol", 1.0)
         vel   = mover.get("velocity", 1.0)
         rng   = mover.get("range_pct", 0)
         score = mover.get("crime_score", 0)
+        vol   = mover.get("volume_24h", 0)
 
-        # Build structured prompt — facts first
         context = (
-            f"=== CRIME DETECTION: {sym}/USDT ===\n\n"
-            f"24h Move:        {chg:+.1f}% ({mover.get('direction', 'UNKNOWN')})\n"
+            f"=== MEXC MOVER ANALYSIS: {sym}/USDT ===\n\n"
+            f"24h Move:         {chg:+.1f}% ({mover.get('direction','UNKNOWN')})\n"
             f"Volume vs Normal: {rvol:.1f}x\n"
-            f"Price Velocity:  {vel:.1f}x (recent vs prior period)\n"
-            f"Daily Range:     {rng:.1f}% of price\n"
-            f"Crime Score:     {score:.0f}\n"
-            f"Volume 24h:      {vol:,.0f}\n"
+            f"Price Velocity:   {vel:.1f}x\n"
+            f"Daily Range:      {rng:.1f}%\n"
+            f"Crime Score:      {score:.0f}\n"
+            f"Volume 24h:       {vol:,.0f}\n"
         )
 
         prompt = (
             f"{context}\n\n"
-            f"Analyze this suspicious move. Answer:\n"
-            f"1. Does this look like coordinated manipulation or organic? Why?\n"
-            f"2. What pattern does this match (pump-and-dump, stop hunt, whale accumulation)?\n"
-            f"3. What should a trader watch for next — continuation, reversal, or trap?\n"
-            f"Keep it under 120 words. Be direct."
+            f"Classify this move and tell the trader what to do:\n"
+            f"1. Coordinated manipulation or organic move?\n"
+            f"2. Pattern: pump-and-dump / stop hunt / whale accumulation / organic breakout?\n"
+            f"3. Trend continuation or exhaustion/reversal risk?\n"
+            f"4. What should the trader watch for next?\n"
+            f"Under 100 words. Direct."
         )
 
         return ask([
             {"role": "system", "content":
-             "You are Scout, a market intelligence companion. Analyze market crime patterns. "
-             "Only use the data provided. Be direct — if it looks like manipulation, say so."},
+             "You are Scout, a market intelligence assistant. Analyze MEXC perpetual futures moves. "
+             "Only use provided data. Be specific about whether to trade or avoid."},
             {"role": "user", "content": prompt},
         ], max_tokens=180)
     except Exception:
         return ""
 
 
+# ── generate_setups_response — P13 structured output ─────────────────────
+
+def generate_setups_response(symbols: list = None) -> str:
+    """
+    P13: generate ranked, structured setup output via 0G Compute.
+    This is the companion to best_opportunities() — uses SETUP_SYSTEM_PROMPT
+    which forces the model into a strict entry/SL/TP format.
+    """
+    from app.market_data import get_klines, DEFAULT_WATCHLIST
+    from app.mexc_data import get_funding_rate as mexc_funding
+
+    symbols     = symbols or DEFAULT_WATCHLIST[:8]
+    candles_map = {}
+    funding_map = {}
+
+    for sym in symbols:
+        try:
+            candles_map[sym] = {
+                "m15":   get_klines(sym, "15m", 96),
+                "h1":    get_klines(sym, "1h",  50),
+                "h4":    get_klines(sym, "4h",  50),
+                "daily": get_klines(sym, "1d",  30),
+            }
+            fd = mexc_funding(sym)
+            if fd.get("ok"):
+                funding_map[sym] = fd["funding_rate"]
+        except Exception:
+            pass
+
+    top = rank_opportunities(symbols, candles_map, funding_map, top_n=3)
+    if not top:
+        return "No ranked setups available at this time."
+
+    intel_blocks = [format_intelligence_for_model(i) for i in top]
+    context = "\n\n---\n\n".join(intel_blocks)
+
+    prompt = (
+        f"Here is market intelligence for the top {len(top)} ranked symbols.\n\n"
+        f"{context}\n\n"
+        f"Generate a full trade setup for each. "
+        f"Use only the levels in the data. "
+        f"If no setup exists for a symbol, write 'No Setup — [reason]'."
+    )
+
+    try:
+        return ask([
+            {"role": "system", "content": SETUP_SYSTEM_PROMPT},
+            {"role": "user",   "content": prompt},
+        ], max_tokens=700)
+    except ZGComputeError as e:
+        return f"⚠️ 0G Compute unavailable: {e}"
+
+
+# ── chat — general free-form questions ───────────────────────────────────
+
 def chat(message: str, recent_context: list = None) -> str:
-    """
-    General chat — free-form questions. Tries to extract relevant intelligence
-    if a symbol is mentioned, otherwise uses pure model reasoning.
-    """
+    """General chat — no symbol detected, no opportunity keywords."""
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     if recent_context:
         messages.extend(recent_context[-6:])
@@ -320,27 +430,77 @@ def chat(message: str, recent_context: list = None) -> str:
         return f"⚠️ Couldn't reach 0G Compute right now ({e})."
 
 
-# ── Intent routing ────────────────────────────────────────────────────────
+# ── Intent routing — P2: monitoring ≠ analysis ───────────────────────────
+
 _KNOWN_SYMBOLS = {s.replace("USDT", ""): s for s in market_data.DEFAULT_WATCHLIST}
-_OPPORTUNITY_WORDS = ("best", "opportunit", "setup", "what should i", "anything good",
-                      "rank", "top setup", "what's hot", "what is hot")
+
+_OPPORTUNITY_WORDS = (
+    "best", "setup", "setups", "opportunit", "what should i trade",
+    "anything good", "rank", "top setup", "what's hot", "what is hot",
+    "give me setups", "show me setups", "find setups", "any trades",
+    "good trades", "best trades", "what to trade", "trade ideas",
+)
+
+_ANALYSIS_WORDS = (
+    "what's happening", "what is happening", "what's going on",
+    "analysis", "analyse", "analyze", "explain", "tell me about",
+    "whats up with", "what about", "how is", "what do you think",
+    "bias on", "structure on", "read on",
+)
+
+_MAJOR_WORDS = (
+    "majors", "btc", "bitcoin", "eth", "ethereum", "sol", "solana",
+    "market overview", "market snapshot", "all majors",
+)
 
 
 def _find_symbol(text: str) -> str:
     upper = text.upper()
+    # Direct USDT match
+    m = __import__("re").search(r'\b([A-Z]{2,10})USDT\b', upper)
+    if m:
+        sym = m.group(1) + "USDT"
+        if sym in _KNOWN_SYMBOLS.values():
+            return sym
+    # Short name match
     for short, full in _KNOWN_SYMBOLS.items():
-        if short in upper or full in upper:
+        if __import__("re").search(r'\b' + short + r'\b', upper):
             return full
     return ""
 
 
-def route_message(text: str, recent_context: list = None) -> str:
+def route_message(text: str, recent_context: list = None, chat_id: int = None) -> str:
     """
-    Route free-text to the right function.
+    P2: strict separation between monitoring and analysis paths.
+
+    Monitoring requests → handled in telegram_bot.py, never reach here.
+    Analysis requests → explain_symbol / best_opportunities / chat.
     """
+    text_lower = text.lower()
+
+    # ── Symbol-specific analysis ──────────────────────────────────────────
     symbol = _find_symbol(text)
     if symbol:
         return explain_symbol(symbol, user_question=text)
-    if any(w in text.lower() for w in _OPPORTUNITY_WORDS):
+
+    # ── Opportunity / setup discovery (P12/P13) ───────────────────────────
+    if any(w in text_lower for w in _OPPORTUNITY_WORDS):
         return best_opportunities()
+
+    # ── Market overview request ───────────────────────────────────────────
+    if any(w in text_lower for w in _MAJOR_WORDS):
+        try:
+            from app.scanner import get_major_summary
+            summary = get_major_summary()
+            if "not yet loaded" not in summary:
+                return summary
+        except Exception:
+            pass
+        return best_opportunities()
+
+    # ── General analysis ask ──────────────────────────────────────────────
+    if any(w in text_lower for w in _ANALYSIS_WORDS):
+        return chat(text, recent_context=recent_context)
+
+    # ── Default: general chat ─────────────────────────────────────────────
     return chat(text, recent_context=recent_context)

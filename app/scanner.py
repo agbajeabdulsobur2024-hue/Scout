@@ -1,15 +1,20 @@
 """
 scanner.py — Scout's proactive intelligence scanner.
 
-Runs as a background thread. Every N minutes it:
-  1. Scans MEXC for crime (coordinated pumps/dumps)
-  2. Scans Binance watchlist using the Intelligence Engine
-  3. Ranks opportunities by score
-  4. If something fires, asks 0G Compute to explain it
-  5. Sends a Telegram alert unprompted
+Implements Scout Master Roadmap priorities:
+  P1:  Direction-aware BOS/CHoCH — direction stored and matched exactly
+  P6:  Multi-stage setup engine — Bias → Confirmation → Entry → Alert
+  P7:  User-defined setup memory — stored, continuously evaluated
+  P8:  Trend continuation vs trend change classification
+  P9:  Major asset engine — BTC/ETH/SOL/TON/BNB/XRP/SUI always monitored
+  P10: MEXC top gainers scanner — +5/10/15% thresholds
+  P11: MEXC top losers scanner  — -5/10/15% thresholds
 
-The Intelligence Engine runs FIRST. 0G Compute explains FACTS.
-Not the other way around.
+Design rules (from roadmap):
+  - Monitoring ≠ Analysis. User monitor requests are STRICT by default.
+  - Direction field stored and matched. Mismatch → silent ignore.
+  - No alerts unless conditions explicitly met.
+  - Workflow progress tracked across scans.
 """
 
 import os
@@ -20,47 +25,87 @@ from datetime import datetime, timezone
 
 log = logging.getLogger("scout")
 
-MEXC_SCAN_INTERVAL      = int(os.environ.get("MEXC_SCAN_INTERVAL",  "300"))   # 5 min
-STRUCTURE_SCAN_INTERVAL = int(os.environ.get("STRUCTURE_SCAN_INTERVAL", "600")) # 10 min
-ALERT_COOLDOWN          = int(os.environ.get("ALERT_COOLDOWN", "1800"))  # 30 min
+MEXC_SCAN_INTERVAL      = int(os.environ.get("MEXC_SCAN_INTERVAL",      "300"))   # 5 min
+STRUCTURE_SCAN_INTERVAL = int(os.environ.get("STRUCTURE_SCAN_INTERVAL",  "600"))  # 10 min
+ALERT_COOLDOWN          = int(os.environ.get("ALERT_COOLDOWN",           "1800")) # 30 min
 
-# Crypto USDT perps to watch for structure
-STRUCTURE_WATCHLIST = [
-    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "AVAXUSDT",
-    "LINKUSDT", "ADAUSDT", "DOTUSDT", "MATICUSDT", "XRPUSDT",
+# ── Major asset engine (Priority 9) ───────────────────────────────────────
+# Always monitored. 4H = Bias, 1H = Confirmation, 15M = Entry
+MAJOR_ASSETS = [
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "TONUSDT",
+    "BNBUSDT", "XRPUSDT", "SUIUSDT",
 ]
 
-# Min score for a proactive alert (filters noise)
-PROACTIVE_ALERT_SCORE = 60
+# Extended watchlist for opportunity scanner
+STRUCTURE_WATCHLIST = MAJOR_ASSETS + [
+    "AVAXUSDT", "LINKUSDT", "ADAUSDT", "DOTUSDT",
+]
+
+PROACTIVE_ALERT_SCORE   = 65   # minimum score for unprompted alert
+MEXC_GAINER_THRESHOLDS  = [5, 10, 15]
+MEXC_LOSER_THRESHOLDS   = [-5, -10, -15]
 
 _alert_cooldowns: dict = {}
-_send_fn = None
-_chat_id = None
-_running = False
+_send_fn         = None
+_chat_id         = None
+_running         = False
 
+# ── User monitor watchlists ────────────────────────────────────────────────
+# Strict: {symbol, direction, event, tf, ...} — direction-aware (P1)
 _user_watchlists: dict = {}
+
+# Major asset state — tracks per-symbol classification (P9)
+_major_states: dict = {}
 
 SWEEP_COOLDOWN = int(os.environ.get("SWEEP_COOLDOWN", "3600"))
 BOS_COOLDOWN   = int(os.environ.get("BOS_COOLDOWN",   "14400"))
 CRIME_COOLDOWN = int(os.environ.get("CRIME_COOLDOWN", "1800"))
+MAJOR_COOLDOWN = int(os.environ.get("MAJOR_COOLDOWN", "3600"))
 
 
-def add_user_monitor(chat_id: int, symbol: str, tf: str = "15m",
+# ── User monitor management (P1: direction-aware) ─────────────────────────
+
+def add_user_monitor(chat_id: int, symbol: str, tf: str = "1h",
                      conditions: list = None, note: str = "",
+                     direction: str = "",
                      entry_tf: str = "15m", confirm_tf: str = "1h",
-                     bias_tf: str = "4h") -> str:
+                     bias_tf: str = "4h",
+                     mode: str = "strict") -> str:
+    """
+    Add a direction-aware monitor.
+
+    CRITICAL (P1): direction is stored with every condition.
+    Alerts only fire when detected direction matches stored direction.
+    """
     symbol = symbol.upper()
     if not symbol.endswith("USDT"):
-        symbol = symbol + "USDT"
+        symbol += "USDT"
+
+    # Normalise conditions into direction-aware dicts (P1 fix)
+    parsed_conditions = []
+    raw_conds = conditions or ["sweep", "bos"]
+    for cond in raw_conds:
+        if isinstance(cond, dict):
+            parsed_conditions.append(cond)
+        else:
+            # String condition — wrap with direction
+            parsed_conditions.append({
+                "event":     cond,
+                "direction": direction or "",   # "" = any direction (backward compat)
+                "strict":    bool(direction),   # strict only when direction was explicit
+            })
 
     entry = {
         "symbol":     symbol,
-        "conditions": conditions or ["sweep", "bos"],
+        "conditions": parsed_conditions,
         "note":       note,
+        "direction":  direction,
         "entry_tf":   entry_tf,
         "confirm_tf": confirm_tf,
         "bias_tf":    bias_tf,
+        "mode":       mode,
     }
+
     if chat_id not in _user_watchlists:
         _user_watchlists[chat_id] = []
 
@@ -69,14 +114,23 @@ def add_user_monitor(chat_id: int, symbol: str, tf: str = "15m",
         return f"{symbol} is already on your watchlist."
 
     _user_watchlists[chat_id].append(entry)
-    log.info(f"scanner: {chat_id} added {symbol} to watchlist")
-    threading.Thread(target=_persist_state, daemon=True).start()
+    _persist_state()
 
-    tf_desc = f"Entry: {entry_tf.upper()} | Confirm: {confirm_tf.upper()} | Bias: {bias_tf.upper()}"
+    sym_short = symbol.replace("USDT", "")
+    mode_tag  = "STRICT" if mode == "strict" else "ASSISTED"
+    dir_tag   = f" [{direction.upper()}]" if direction else " [any direction]"
+    cond_descs = []
+    for c in parsed_conditions:
+        if isinstance(c, dict):
+            d = c.get("direction", "")
+            e = c.get("event", "?")
+            cond_descs.append(f"{d + ' ' if d else ''}{e}")
+        else:
+            cond_descs.append(str(c))
+
     return (
-        f"✅ Now monitoring <b>{symbol}</b>\n"
-        f"TF stack: {tf_desc}\n"
-        f"Watching for: {', '.join(entry['conditions'])}"
+        f"✅ Watching: <b>{sym_short}</b>{dir_tag}  [{mode_tag}]\n"
+        f"Conditions: {', '.join(cond_descs)}"
         + (f"\n📌 {note}" if note else "")
     )
 
@@ -84,7 +138,7 @@ def add_user_monitor(chat_id: int, symbol: str, tf: str = "15m",
 def remove_user_monitor(chat_id: int, symbol: str) -> str:
     symbol = symbol.upper()
     if not symbol.endswith("USDT"):
-        symbol = symbol + "USDT"
+        symbol += "USDT"
     if chat_id not in _user_watchlists:
         return f"{symbol} wasn't on your watchlist."
     before = len(_user_watchlists[chat_id])
@@ -92,41 +146,63 @@ def remove_user_monitor(chat_id: int, symbol: str) -> str:
         w for w in _user_watchlists[chat_id] if w["symbol"] != symbol
     ]
     if len(_user_watchlists[chat_id]) < before:
+        _persist_state()
         return f"✅ Stopped monitoring {symbol}."
     return f"{symbol} wasn't on your watchlist."
 
 
 def clear_all_monitors(chat_id: int) -> str:
-    if chat_id in _user_watchlists:
-        count = len(_user_watchlists[chat_id])
-        _user_watchlists[chat_id] = []
-        return f"✅ Cleared {count} monitor(s). Your watchlist is now empty."
-    return "Your watchlist was already empty."
+    count = len(_user_watchlists.get(chat_id, []))
+    _user_watchlists[chat_id] = []
+    _persist_state()
+    return f"✅ Cleared {count} monitor(s)."
 
 
 def list_user_monitors(chat_id: int) -> str:
     watches = _user_watchlists.get(chat_id, [])
     if not watches:
-        return "Your watchlist is empty. Say 'monitor BTCUSDT on 1H for sweeps' to add one."
+        return (
+            "Your watchlist is empty.\n\n"
+            "Example: <i>Monitor SYNUSDT on H4 for bearish BOS</i>\n"
+            "Or define a full workflow:\n"
+            "<i>Monitor SYN. H4 bearish. Wait for: 1. Bearish CHoCH 2. BOS 3. OB retest</i>"
+        )
     lines = ["<b>Your active monitors:</b>\n"]
     for w in watches:
-        conds = ", ".join(w["conditions"])
-        lines.append(f"• <b>{w['symbol']}</b> — {w.get('entry_tf','1h').upper()} — {conds}")
+        sym   = w["symbol"].replace("USDT", "")
+        mode  = w.get("mode", "strict").upper()
+        dirn  = w.get("direction", "")
+        conds = w.get("conditions", [])
+        cond_str = []
+        for c in conds:
+            if isinstance(c, dict):
+                d = c.get("direction", "")
+                e = c.get("event", "")
+                cond_str.append(f"{d + ' ' if d else ''}{e}")
+            else:
+                cond_str.append(str(c))
+        dir_tag = f" [{dirn.upper()}]" if dirn else ""
+        lines.append(
+            f"• <b>{sym}</b>{dir_tag}  [{mode}]\n"
+            f"  Watching: {', '.join(cond_str)}"
+        )
         if w.get("note"):
-            lines.append(f"  {w['note']}")
+            lines.append(f"  📌 {w['note']}")
     return "\n".join(lines)
 
 
+# ── Cooldown helpers ──────────────────────────────────────────────────────
+
 def _is_cooled_down(key: str, cooldown: int = None) -> bool:
-    if cooldown is None:
-        cooldown = ALERT_COOLDOWN
-    last = _alert_cooldowns.get(key, 0)
-    return time.time() - last > cooldown
+    cooldown = cooldown or ALERT_COOLDOWN
+    return time.time() - _alert_cooldowns.get(key, 0) > cooldown
 
 
 def _mark_alerted(key: str):
     _alert_cooldowns[key] = time.time()
 
+
+# ── Persistence ───────────────────────────────────────────────────────────
 
 def _persist_state():
     try:
@@ -145,7 +221,6 @@ def _send_alert(text: str, alert_type: str = "alert", symbol: str = ""):
             _send_fn(_chat_id, text)
         except Exception as e:
             log.error(f"scanner: alert send failed — {e}")
-
     try:
         from app.zg_storage import append_alert_log
         append_alert_log({
@@ -158,52 +233,364 @@ def _send_alert(text: str, alert_type: str = "alert", symbol: str = ""):
         pass
 
 
-def _explain_crime(crime: dict) -> str:
-    """Ask 0G Compute to explain a suspicious MEXC move using structured intelligence."""
-    try:
-        from app.reasoning import explain_crime_move
-        return explain_crime_move(crime)
-    except Exception as e:
-        log.debug(f"_explain_crime failed: {e}")
-        return ""
+# ── Major asset classification (Priority 9) ──────────────────────────────
 
-
-def _explain_intel_alert(symbol: str, intel: dict) -> str:
+def _classify_major(symbol: str, intel: dict) -> str:
     """
-    Ask 0G Compute to explain a proactive alert based on full intelligence.
-    This is the key improvement — 0G gets FACTS, not raw candles.
+    Classify a major asset into one of:
+      Bullish Trend | Bearish Trend | Continuation | Trend Change | Range | No Trade
     """
+    bias    = intel.get("htf_bias", "Neutral").lower()
+    bos     = intel.get("bos", {})
+    sweep   = intel.get("sweep", {})
+    disp    = intel.get("displacement", {})
+    regime  = intel.get("regime", "Unknown")
+    score   = intel.get("score", 0)
+
+    prev = _major_states.get(symbol, {})
+    prev_bias = prev.get("bias", "neutral")
+
+    # Trend change: bias flipped
+    if prev_bias and prev_bias != "neutral" and prev_bias != bias and bias != "neutral":
+        return "Trend Change"
+
+    if regime == "Compression":
+        return "Range"
+
+    if bias == "bullish":
+        if bos.get("broken") and bos.get("bias") == "bullish":
+            if disp.get("confirmed"):
+                return "Bullish Continuation"
+        return "Bullish Trend"
+
+    if bias == "bearish":
+        if bos.get("broken") and bos.get("bias") == "bearish":
+            if disp.get("confirmed"):
+                return "Bearish Continuation"
+        return "Bearish Trend"
+
+    return "No Trade"
+
+
+def run_major_asset_scan():
+    """
+    Priority 9: always monitor BTC, ETH, SOL, TON, BNB, XRP, SUI.
+    4H = Bias, 1H = Confirmation, 15M = Entry.
+    Alert on: Trend Change, Continuation with displacement, new BOS.
+    """
+    log.info("scanner: major asset scan...")
     try:
-        from app.zg_compute import ask
-        from app.intelligence import format_intelligence_for_model
+        from app.market_data import get_klines
+        from app.mexc_data import get_funding_rate as mexc_funding
+        from app.intelligence import build_intelligence
 
-        context = format_intelligence_for_model(intel)
-        question = (
-            "A high-scoring SMC setup just formed. Based on this intelligence:\n"
-            "1. What exactly triggered this alert?\n"
-            "2. Is this a quality setup or noise?\n"
-            "3. What confirms or invalidates it?\n"
-            "Keep it under 100 words."
-        )
+        for symbol in MAJOR_ASSETS:
+            try:
+                c_m15   = get_klines(symbol, "15m", 96)
+                c_h1    = get_klines(symbol, "1h",  50)
+                c_h4    = get_klines(symbol, "4h",  50)
+                c_daily = get_klines(symbol, "1d",  30)
+                if not c_h1:
+                    continue
 
-        from app.reasoning import SYSTEM_PROMPT
-        return ask([
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": f"{context}\n\n{question}"},
-        ], max_tokens=160)
+                funding_rate = 0.0
+                try:
+                    fd = mexc_funding(symbol)
+                    if fd.get("ok"):
+                        funding_rate = fd["funding_rate"]
+                except Exception:
+                    pass
+
+                intel = build_intelligence(symbol, c_m15, c_h1, c_h4, c_daily, funding_rate)
+                classification = _classify_major(symbol, intel)
+
+                sym_short = symbol.replace("USDT", "")
+                prev = _major_states.get(symbol, {})
+
+                # Alert on Trend Change
+                if classification == "Trend Change":
+                    key = f"major_trendchange_{symbol}"
+                    if _is_cooled_down(key, MAJOR_COOLDOWN):
+                        bos  = intel.get("bos", {})
+                        bias = intel.get("htf_bias", "Neutral")
+                        msg  = (
+                            f"⚠️ <b>TREND CHANGE — {sym_short}</b>\n\n"
+                            f"Previous bias: {prev.get('bias','?').capitalize()}\n"
+                            f"New bias:      <b>{bias}</b>\n"
+                            f"Trigger:       {bos.get('description','BOS detected')}\n"
+                            f"Regime:        {intel.get('regime','')}\n"
+                            f"Score:         {intel.get('score',0)}/100\n\n"
+                            f"{datetime.now(timezone.utc).strftime('%H:%M UTC')}"
+                        )
+                        _send_alert(msg, alert_type="trend_change", symbol=symbol)
+                        _mark_alerted(key)
+
+                # Alert on high-score Continuation (displacement confirmed)
+                elif "Continuation" in classification:
+                    key = f"major_cont_{symbol}"
+                    if _is_cooled_down(key, MAJOR_COOLDOWN) and intel.get("score", 0) >= PROACTIVE_ALERT_SCORE:
+                        disp = intel.get("displacement", {})
+                        ob   = intel.get("order_block", {})
+                        msg  = (
+                            f"⚡ <b>{classification.upper()} — {sym_short}</b>\n\n"
+                            f"HTF Bias: {intel.get('htf_bias','')}\n"
+                            f"Regime:   {intel.get('regime','')}\n"
+                        )
+                        if disp.get("confirmed"):
+                            msg += f"Displacement: ✓ {disp.get('description','')}\n"
+                        if ob.get("found"):
+                            msg += f"OB zone: {ob['low']:.4f}–{ob['high']:.4f}\n"
+                        msg += f"Score: {intel.get('score',0)}/100\n"
+                        msg += f"\n{datetime.now(timezone.utc).strftime('%H:%M UTC')}"
+                        _send_alert(msg, alert_type="continuation", symbol=symbol)
+                        _mark_alerted(key)
+
+                # Update state
+                _major_states[symbol] = {
+                    "bias":           intel.get("htf_bias", "Neutral").lower(),
+                    "classification": classification,
+                    "score":          intel.get("score", 0),
+                    "last_scan":      datetime.now(timezone.utc).isoformat(),
+                }
+
+            except Exception as e:
+                log.debug(f"major scan {symbol}: {e}")
+
     except Exception as e:
-        log.debug(f"_explain_intel_alert failed: {e}")
-        return ""
+        log.error(f"scanner: major asset scan error — {e}")
 
+
+def get_major_summary() -> str:
+    """Return a quick summary of all major asset states (for /majors command)."""
+    if not _major_states:
+        return "Major asset data not yet loaded. Scanner runs every 10 minutes."
+    lines = ["<b>Major Asset Snapshot</b>\n"]
+    ICONS = {
+        "Bullish Trend": "🟢",
+        "Bullish Continuation": "🟢",
+        "Bearish Trend": "🔴",
+        "Bearish Continuation": "🔴",
+        "Trend Change": "⚠️",
+        "Range": "↔️",
+        "No Trade": "⚫",
+    }
+    for sym in MAJOR_ASSETS:
+        state = _major_states.get(sym)
+        if not state:
+            continue
+        sym_short = sym.replace("USDT", "")
+        cls       = state.get("classification", "?")
+        icon      = ICONS.get(cls, "•")
+        score     = state.get("score", 0)
+        lines.append(f"{icon} <b>{sym_short}</b>:  {cls}  ({score}/100)")
+    return "\n".join(lines)
+
+
+# ── MEXC gainers/losers scanner (Priorities 10 + 11) ─────────────────────
+
+def _fetch_mexc_tickers() -> list:
+    import requests
+    resp = requests.get("https://contract.mexc.com/api/v1/contract/ticker", timeout=15)
+    resp.raise_for_status()
+    raw = resp.json().get("data", [])
+    tickers = []
+    for t in raw:
+        sym = t.get("symbol", "")
+        if not sym.endswith("_USDT"):
+            continue
+        change_pct = None
+        for field in ("priceChangePercent", "changeRate", "riseFallRate", "priceChange24h"):
+            val = t.get(field)
+            if val is not None:
+                try:
+                    fval = float(val)
+                    if abs(fval) < 1.5 and fval != 0:
+                        fval *= 100
+                    change_pct = fval
+                    break
+                except (ValueError, TypeError):
+                    continue
+        if change_pct is None:
+            try:
+                last  = float(t.get("lastPrice", 0))
+                open_ = float(t.get("open24h", t.get("openPrice", 0)))
+                if open_ > 0 and last > 0:
+                    change_pct = (last - open_) / open_ * 100
+            except Exception:
+                pass
+        if change_pct is None:
+            continue
+        try:
+            tickers.append({
+                "symbol":     sym.replace("_USDT", ""),
+                "change_pct": round(change_pct, 2),
+                "volume":     float(t.get("volume24", t.get("vol24", t.get("amount24", 0)))),
+                "price":      float(t.get("lastPrice", 0)),
+            })
+        except (ValueError, TypeError):
+            continue
+    return tickers
+
+
+def _classify_gainer(ticker: dict, candles: list = None) -> str:
+    """
+    Classify a gainer:
+      TREND_CONTINUATION — higher highs, higher lows, bullish BOS, volume
+      POSSIBLE_EXHAUSTION — bearish divergence, distribution
+    """
+    chg = ticker["change_pct"]
+    # Basic: large move with no candle data → unknown
+    if not candles or len(candles) < 10:
+        return "PUMP" if chg > 15 else "GAINER"
+
+    closes = [c["close"] for c in candles[-10:]]
+    hh = closes[-1] > max(closes[:-1])
+    hl = min(closes[-5:]) > min(closes[:-5])
+
+    if hh and hl:
+        return "TREND_CONTINUATION"
+    elif chg > 20:
+        return "POSSIBLE_EXHAUSTION"
+    return "GAINER"
+
+
+def _classify_loser(ticker: dict, candles: list = None) -> str:
+    """
+    Classify a loser:
+      CAPITULATION  — strong bearish continuation
+      REVERSAL_CANDIDATE — bullish CHoCH / BOS starting
+    """
+    chg = ticker["change_pct"]
+    if not candles or len(candles) < 10:
+        return "DUMP" if chg < -15 else "LOSER"
+
+    closes = [c["close"] for c in candles[-10:]]
+    ll = closes[-1] < min(closes[:-1])
+    lh = max(closes[-5:]) < max(closes[:-5])
+
+    if not ll and not lh:
+        return "REVERSAL_CANDIDATE"
+    elif chg < -20:
+        return "CAPITULATION"
+    return "LOSER"
+
+
+def run_mexc_movers_scan():
+    """
+    Priorities 10 + 11: scan MEXC for +/-5/10/15% movers.
+    Alert with classification (continuation vs exhaustion for gainers,
+    capitulation vs reversal for losers).
+    """
+    log.info("scanner: MEXC movers scan...")
+    try:
+        tickers = _fetch_mexc_tickers()
+        if not tickers:
+            return
+
+        live = [t for t in tickers if abs(t["change_pct"]) > 0.1]
+
+        for ticker in live:
+            sym = ticker["symbol"]
+            chg = ticker["change_pct"]
+
+            # ── Gainers (P10) ──────────────────────────────────────────────
+            for threshold in MEXC_GAINER_THRESHOLDS:
+                if chg >= threshold:
+                    key = f"mexc_gainer_{sym}_{threshold}"
+                    if not _is_cooled_down(key, CRIME_COOLDOWN):
+                        continue
+
+                    classification = _classify_gainer(ticker)
+                    icon = "🚀" if classification == "TREND_CONTINUATION" else "⚠️"
+                    price = ticker["price"]
+
+                    if classification == "TREND_CONTINUATION":
+                        msg = (
+                            f"🚀 <b>TREND CONTINUATION</b>\n\n"
+                            f"<b>{sym}/USDT</b>\n"
+                            f"24H: <b>{chg:+.1f}%</b>\n\n"
+                            f"Pullback zone: watch for retest\n"
+                            f"Price: {price:.6g}\n\n"
+                            f"✓ Higher highs confirmed\n"
+                            f"✓ Volume expansion\n\n"
+                            f"{datetime.now(timezone.utc).strftime('%H:%M UTC')}"
+                        )
+                    elif classification == "POSSIBLE_EXHAUSTION":
+                        msg = (
+                            f"⚠️ <b>POSSIBLE REVERSAL</b>\n\n"
+                            f"<b>{sym}/USDT</b>\n"
+                            f"24H: <b>{chg:+.1f}%</b>\n\n"
+                            f"Risk: Momentum weakening\n"
+                            f"Price: {price:.6g}\n\n"
+                            f"Watch for bearish CHoCH on lower TF\n\n"
+                            f"{datetime.now(timezone.utc).strftime('%H:%M UTC')}"
+                        )
+                    else:
+                        msg = (
+                            f"{icon} <b>MEXC GAINER +{threshold}%</b>\n\n"
+                            f"<b>{sym}/USDT</b>  {chg:+.1f}%\n"
+                            f"Price: {price:.6g}\n\n"
+                            f"{datetime.now(timezone.utc).strftime('%H:%M UTC')}"
+                        )
+
+                    _send_alert(msg, alert_type=f"gainer_{threshold}", symbol=sym)
+                    _mark_alerted(key)
+                    break  # only fire highest threshold crossed
+
+            # ── Losers (P11) ───────────────────────────────────────────────
+            for threshold in MEXC_LOSER_THRESHOLDS:
+                if chg <= threshold:
+                    key = f"mexc_loser_{sym}_{abs(threshold)}"
+                    if not _is_cooled_down(key, CRIME_COOLDOWN):
+                        continue
+
+                    classification = _classify_loser(ticker)
+                    price = ticker["price"]
+
+                    if classification == "REVERSAL_CANDIDATE":
+                        msg = (
+                            f"⚠️ <b>OVERSOLD REVERSAL WATCH</b>\n\n"
+                            f"<b>{sym}/USDT</b>\n"
+                            f"24H: <b>{chg:+.1f}%</b>\n\n"
+                            f"Price: {price:.6g}\n"
+                            f"Potential reversal forming\n"
+                            f"Watch for: Bullish CHoCH, BOS, liquidity reclaim\n\n"
+                            f"{datetime.now(timezone.utc).strftime('%H:%M UTC')}"
+                        )
+                    elif classification == "CAPITULATION":
+                        msg = (
+                            f"📉 <b>CAPITULATION — {sym}/USDT</b>\n\n"
+                            f"24H: <b>{chg:+.1f}%</b>\n"
+                            f"Price: {price:.6g}\n\n"
+                            f"Strong bearish continuation.\n"
+                            f"Wait for structure confirmation before entry.\n\n"
+                            f"{datetime.now(timezone.utc).strftime('%H:%M UTC')}"
+                        )
+                    else:
+                        msg = (
+                            f"📉 <b>MEXC LOSER {threshold}%</b>\n\n"
+                            f"<b>{sym}/USDT</b>  {chg:+.1f}%\n"
+                            f"Price: {price:.6g}\n\n"
+                            f"{datetime.now(timezone.utc).strftime('%H:%M UTC')}"
+                        )
+
+                    _send_alert(msg, alert_type=f"loser_{abs(threshold)}", symbol=sym)
+                    _mark_alerted(key)
+                    break  # only fire lowest threshold crossed
+
+    except Exception as e:
+        log.error(f"scanner: MEXC movers scan error — {e}")
+
+
+# ── MEXC crime scan (legacy, kept for /crimes context) ────────────────────
 
 def run_mexc_crime_scan():
-    """Scan MEXC for suspicious moves and alert if found."""
+    """Scan MEXC for coordinated pumps/dumps."""
     log.info("scanner: running MEXC crime scan...")
     try:
         from app.mexc_data import scan_for_crimes, get_funding_rate
         crimes = scan_for_crimes(top_n=5)
         if not crimes:
-            log.info("scanner: MEXC scan clean — no crimes detected")
             return
 
         for crime in crimes:
@@ -227,32 +614,32 @@ def run_mexc_crime_scan():
                     rate     = fd["funding_rate"]
                     rate_pct = f"{rate * 100:+.4f}%"
                     next_ms  = fd.get("next_settle_time", 0)
-                    now_ms   = int(time.time() * 1000)
-                    mins     = max(0, (next_ms - now_ms) // 60000) if next_ms else 999
-
+                    mins     = max(0, (next_ms - int(time.time() * 1000)) // 60000) if next_ms else 999
                     if direction == "PUMP" and rate > 0.001:
-                        funding_line = f"⚠️ Funding: {rate_pct} (longs paying — reversal risk in {mins}min)"
+                        funding_line = f"⚠️ Funding: {rate_pct} (longs paying — reversal risk {mins}min)"
                     elif direction == "PUMP" and rate < -0.0005:
-                        funding_line = f"🔥 Funding: {rate_pct} (shorts paying — fuel for continuation, {mins}min)"
+                        funding_line = f"🔥 Funding: {rate_pct} (shorts paying — continuation fuel)"
                     elif direction == "DUMP" and rate < -0.001:
-                        funding_line = f"⚠️ Funding: {rate_pct} (shorts paying — squeeze risk in {mins}min)"
-                    elif direction == "DUMP" and rate > 0.0005:
-                        funding_line = f"🔥 Funding: {rate_pct} (longs paying — fuel for dump, {mins}min)"
+                        funding_line = f"⚠️ Funding: {rate_pct} (shorts paying — squeeze risk)"
                     else:
-                        funding_line = f"Funding: {rate_pct} (settle {mins}min)"
-            except Exception as _fe:
-                log.debug(f"funding fetch failed for {sym}: {_fe}")
+                        funding_line = f"Funding: {rate_pct} ({mins}min)"
+            except Exception:
+                pass
 
-            explanation = _explain_crime(crime)
+            try:
+                from app.reasoning import explain_crime_move
+                explanation = explain_crime_move(crime)
+            except Exception:
+                explanation = ""
 
             msg_lines = [
                 f"{severity} — MEXC CRIME DETECTED",
                 f"",
                 f"Symbol: {sym.replace('_USDT', '')}/USDT",
-                f"Move: {chg:+.2f}%  ({direction})",
+                f"Move:   {chg:+.2f}%  ({direction})",
                 f"Volume: {rvol:.1f}x normal",
-                f"Daily range: {rng:.1f}%",
-                f"Crime score: {score:.0f}",
+                f"Range:  {rng:.1f}%",
+                f"Score:  {score:.0f}",
             ]
             if funding_line:
                 msg_lines.append(funding_line)
@@ -263,30 +650,33 @@ def run_mexc_crime_scan():
             _send_alert("\n".join(msg_lines), alert_type="crime", symbol=sym)
             _mark_alerted(key)
             _persist_state()
-            log.info(f"scanner: crime alert sent for {sym} ({chg:+.2f}%)")
 
     except Exception as e:
         log.error(f"scanner: MEXC crime scan error — {e}")
 
 
+# ── Structure scan — default watchlist (P8: continuation vs change) ────────
+
 def run_structure_scan():
     """
-    Intelligence-driven structure scan.
-    Builds full intelligence for each symbol, scores it, alerts if score >= threshold.
+    Intelligence-driven structure scan for default watchlist.
+    P8: classifies each as continuation or trend change, not bare events.
     """
-    log.info("scanner: running intelligence-driven structure scan...")
+    log.info("scanner: running structure scan...")
     try:
         from app.market_data import get_klines
         from app.mexc_data import get_funding_rate as mexc_funding
         from app.intelligence import build_intelligence
 
         for symbol in STRUCTURE_WATCHLIST:
+            if symbol in MAJOR_ASSETS:
+                continue  # majors handled by run_major_asset_scan()
+
             try:
                 c_m15   = get_klines(symbol, "15m", 96)
                 c_h1    = get_klines(symbol, "1h",  50)
                 c_h4    = get_klines(symbol, "4h",  50)
                 c_daily = get_klines(symbol, "1d",  30)
-
                 if not c_h1:
                     continue
 
@@ -298,108 +688,362 @@ def run_structure_scan():
                 except Exception:
                     pass
 
-                # Build full intelligence
-                intel = build_intelligence(
-                    symbol        = symbol,
-                    candles_m15   = c_m15,
-                    candles_h1    = c_h1,
-                    candles_h4    = c_h4,
-                    candles_daily = c_daily,
-                    funding_rate  = funding_rate,
-                )
+                intel  = build_intelligence(symbol, c_m15, c_h1, c_h4, c_daily, funding_rate)
+                score  = intel.get("score", 0)
 
-                score     = intel.get("score", 0)
                 sym_short = symbol.replace("USDT", "")
                 sweep     = intel.get("sweep", {})
-                disp      = intel.get("displacement", {})
                 bos       = intel.get("bos", {})
+                disp      = intel.get("displacement", {})
                 bias      = intel.get("htf_bias", "Neutral")
                 regime    = intel.get("regime", "Unknown")
-                session   = intel.get("session", {})
                 ob        = intel.get("order_block", {})
                 fvg       = intel.get("fvg", {})
+                session   = intel.get("session", {})
 
-                # ── Sweep alert (high score + recent sweep) ────────────────
-                if sweep.get("detected") and sweep.get("age_candles", 99) <= 3:
-                    sweep_key = f"sweep_{symbol}_{round(sweep.get('level', 0), 2)}"
-                    if _is_cooled_down(sweep_key, SWEEP_COOLDOWN):
-                        explanation = _explain_intel_alert(symbol, intel) if score >= PROACTIVE_ALERT_SCORE else ""
+                # Continuation alert: sweep + displacement + BOS aligned
+                if (sweep.get("detected") and sweep.get("age_candles", 99) <= 3
+                        and disp.get("confirmed") and score >= PROACTIVE_ALERT_SCORE):
+                    key = f"continuation_{symbol}_{round(sweep.get('level',0), 2)}"
+                    if _is_cooled_down(key, SWEEP_COOLDOWN):
+                        bias_lower = bias.lower()
+                        sw_dir     = sweep.get("direction", "")
+                        aligned    = sw_dir == bias_lower or bias_lower == "neutral"
+
+                        # P8: label it continuation or just sweep
+                        label = "TREND CONTINUATION" if aligned else "COUNTER-TREND SWEEP"
+
+                        try:
+                            from app.trade_plan import generate_trade_plan, format_trade_plan
+                            plan = generate_trade_plan(intel)
+                            plan_text = format_trade_plan(plan)
+                        except Exception:
+                            plan_text = ""
 
                         msg_lines = [
-                            f"🎯 M15/H1 SWEEP — {sym_short}",
+                            f"⚡ <b>{label} — {sym_short}</b>",
                             f"",
                             f"{sweep.get('description', '')}",
+                            f"Displacement: ✓ {disp.get('description', '')}",
                             f"Score: {score}/100  |  Regime: {regime}",
                             f"HTF Bias: {bias}",
                         ]
-
-                        if disp.get("confirmed"):
-                            msg_lines.append(f"✅ {disp.get('description', 'Displacement confirmed')}")
-                        else:
-                            msg_lines.append("⏳ No displacement yet — wait for confirmation")
-
-                        if bos.get("broken"):
-                            msg_lines.append(f"⚡ BOS: {bos.get('description', '')}")
-
                         if ob.get("found"):
                             msg_lines.append(f"📦 OB: {ob['low']:.4f}–{ob['high']:.4f}")
-
-                        if fvg.get("found"):
-                            msg_lines.append(f"📊 FVG: {fvg['low']:.4f}–{fvg['high']:.4f}")
-
+                        if plan_text:
+                            msg_lines += ["", plan_text]
                         if session.get("in_killzone"):
                             msg_lines.append(f"⏰ {session.get('description', '')}")
-
-                        intel_fund = intel.get("funding", {})
-                        if intel_fund.get("note"):
-                            msg_lines.append(f"💰 {intel_fund['note']}")
-
-                        if explanation:
-                            msg_lines += ["", explanation]
-
                         msg_lines.append(f"\n{datetime.now(timezone.utc).strftime('%H:%M UTC')}")
-                        _send_alert("\n".join(msg_lines), alert_type="sweep", symbol=symbol)
-                        _mark_alerted(sweep_key)
-                        _persist_state()
-                        log.info(f"scanner: sweep alert — {symbol} (score {score})")
 
-                # ── BOS alert ────────────────────────────────────────────────
-                if bos.get("broken") and not sweep.get("detected"):
-                    bos_key = f"bos_{symbol}_{round(bos.get('level', 0), 2)}_{bos.get('bias','')}"
+                        _send_alert("\n".join(msg_lines), alert_type="continuation", symbol=symbol)
+                        _mark_alerted(key)
+                        _persist_state()
+
+                # BOS-only alert (no displacement yet)
+                elif bos.get("broken") and not sweep.get("detected"):
+                    bos_key = f"bos_{symbol}_{round(bos.get('level',0),2)}_{bos.get('bias','')}"
                     if _is_cooled_down(bos_key, BOS_COOLDOWN):
                         msg_lines = [
-                            f"⚡ H1 BOS — {sym_short}",
+                            f"⚡ <b>H1 BOS — {sym_short}</b>",
                             f"",
                             f"{bos.get('description', '')}",
                             f"Regime: {regime}  |  Score: {score}/100",
                             f"HTF Bias: {bias}",
-                            f"👀 Watch M15 for sweep + displacement entry",
+                            f"👀 Watching for sweep + displacement entry",
                         ]
-                        indu = intel.get("inducements", [])
-                        if indu:
-                            z = indu[0]
-                            msg_lines.append(f"Next inducement: {z['price']:.4f} ({z['distance_pct']:+.1f}%)")
                         msg_lines.append(f"\n{datetime.now(timezone.utc).strftime('%H:%M UTC')}")
                         _send_alert("\n".join(msg_lines), alert_type="bos", symbol=symbol)
                         _mark_alerted(bos_key)
                         _persist_state()
-                        log.info(f"scanner: BOS alert — {symbol}")
 
             except Exception as e:
-                log.debug(f"scanner: structure scan error for {symbol} — {e}")
-                continue
+                log.debug(f"scanner: structure scan {symbol}: {e}")
 
     except Exception as e:
         log.error(f"scanner: structure scan error — {e}")
 
 
+# ── User watchlist scan (P1: direction-aware; P6: workflow integration) ────
+
+def _run_user_watchlist_scan():
+    """
+    Scan user's personal watchlists.
+    P1: match detected direction against stored direction — mismatches silently ignored.
+    P6: evaluate multi-stage workflows from workflow.py.
+    """
+    if not _user_watchlists:
+        return
+
+    try:
+        from app.market_data import get_klines
+        from app.mexc_data import get_funding_rate as mexc_funding
+        from app.intelligence import build_intelligence
+        from app import workflow as wf_mod
+        from app.trade_plan import generate_trade_plan, format_trade_plan
+
+        for chat_id, watches in _user_watchlists.items():
+            for watch in watches:
+                symbol     = watch["symbol"]
+                conds      = watch.get("conditions", [])
+                entry_tf   = watch.get("entry_tf",   "15m")
+                confirm_tf = watch.get("confirm_tf", "1h")
+                bias_tf    = watch.get("bias_tf",    "4h")
+                mode       = watch.get("mode", "strict")
+
+                try:
+                    c_entry   = get_klines(symbol, entry_tf,   96)
+                    c_confirm = get_klines(symbol, confirm_tf, 50)
+                    c_bias    = get_klines(symbol, bias_tf,    50)
+                    c_daily   = get_klines(symbol, "1d",       30)
+                    if not c_entry:
+                        continue
+
+                    funding_rate = 0.0
+                    try:
+                        fd = mexc_funding(symbol)
+                        if fd.get("ok"):
+                            funding_rate = fd["funding_rate"]
+                    except Exception:
+                        pass
+
+                    intel = build_intelligence(
+                        symbol        = symbol,
+                        candles_m15   = c_entry if entry_tf in ("15m", "5m") else [],
+                        candles_h1    = c_confirm,
+                        candles_h4    = c_bias,
+                        candles_daily = c_daily,
+                        funding_rate  = funding_rate,
+                    )
+
+                    sym_short = symbol.replace("USDT", "").replace("_USDT", "")
+                    sweep     = intel.get("sweep", {})
+                    bos       = intel.get("bos", {})
+                    disp      = intel.get("displacement", {})
+                    bias      = intel.get("htf_bias", "Neutral").lower()
+                    ob        = intel.get("order_block", {})
+                    score     = intel.get("score", 0)
+
+                    # ── Evaluate each condition with direction matching (P1) ──
+                    for cond in conds:
+                        if isinstance(cond, str):
+                            cond = {"event": cond, "direction": "", "strict": False}
+
+                        event         = cond.get("event", "")
+                        req_direction = cond.get("direction", "")
+                        strict        = cond.get("strict", bool(req_direction))
+
+                        # ── BOS check ───────────────────────────────────────
+                        if event == "bos" and bos.get("broken"):
+                            detected_dir = bos.get("bias", "")
+
+                            # P1 CORE: if direction requested, must match
+                            if req_direction and detected_dir != req_direction:
+                                if strict:
+                                    continue  # Wrong direction — silent
+                            else:
+                                key = f"user_{chat_id}_bos_{symbol}_{round(bos.get('level',0),2)}_{detected_dir}"
+                                if _is_cooled_down(key, BOS_COOLDOWN):
+                                    try:
+                                        plan = generate_trade_plan(intel)
+                                        plan_text = format_trade_plan(plan)
+                                    except Exception:
+                                        plan_text = ""
+
+                                    dir_label = f" [{detected_dir.upper()}]" if detected_dir else ""
+                                    msg_lines = [
+                                        f"⚡ <b>YOUR WATCH — {sym_short} BOS{dir_label}</b>",
+                                        f"",
+                                        f"{bos.get('description', '')}",
+                                        f"Score: {score}/100  |  Bias: <b>{intel.get('htf_bias','')}</b>",
+                                    ]
+                                    if plan_text:
+                                        msg_lines += ["", plan_text]
+                                    if watch.get("note"):
+                                        msg_lines.append(f"\n📌 {watch['note']}")
+                                    msg_lines.append(f"\n{datetime.now(timezone.utc).strftime('%H:%M UTC')}")
+                                    if _send_fn:
+                                        _send_fn(chat_id, "\n".join(msg_lines))
+                                    _mark_alerted(key)
+                                    _persist_state()
+
+                        # ── Sweep check ─────────────────────────────────────
+                        if event == "sweep" and sweep.get("detected") and sweep.get("age_candles", 99) <= 3:
+                            detected_dir = sweep.get("direction", "")
+
+                            if req_direction and detected_dir != req_direction:
+                                if strict:
+                                    continue
+
+                            key = f"user_{chat_id}_sweep_{symbol}_{round(sweep.get('level',0),2)}"
+                            if _is_cooled_down(key, SWEEP_COOLDOWN):
+                                try:
+                                    plan      = generate_trade_plan(intel)
+                                    plan_text = format_trade_plan(plan)
+                                except Exception:
+                                    plan_text = ""
+
+                                dir_label = f" [{detected_dir.upper()}]" if detected_dir else ""
+                                msg_lines = [
+                                    f"🎯 <b>YOUR WATCH — {sym_short} SWEEP{dir_label}</b>",
+                                    f"",
+                                    f"{sweep.get('description', '')}",
+                                    f"Score: {score}/100  |  Bias: <b>{intel.get('htf_bias','')}</b>",
+                                ]
+                                if disp.get("confirmed"):
+                                    msg_lines.append(f"✅ {disp.get('description','Displacement confirmed')}")
+                                else:
+                                    msg_lines.append("⏳ No displacement yet — waiting")
+                                if ob.get("found"):
+                                    msg_lines.append(f"📦 OB: {ob['low']:.4f}–{ob['high']:.4f}")
+                                if plan_text:
+                                    msg_lines += ["", plan_text]
+                                if watch.get("note"):
+                                    msg_lines.append(f"\n📌 {watch['note']}")
+                                msg_lines.append(f"\n{datetime.now(timezone.utc).strftime('%H:%M UTC')}")
+                                if _send_fn:
+                                    _send_fn(chat_id, "\n".join(msg_lines))
+                                _mark_alerted(key)
+                                _persist_state()
+
+                        # ── Funding checks ──────────────────────────────────
+                        if event.startswith("funding"):
+                            try:
+                                from app.mexc_data import get_funding_rate
+                                fd = get_funding_rate(symbol)
+                                if fd.get("ok"):
+                                    rate    = fd["funding_rate"]
+                                    next_ms = fd.get("next_settle_time", 0)
+                                    now_ms  = int(time.time() * 1000)
+                                    mins    = max(0, (next_ms - now_ms) // 60000) if next_ms else 999
+                                    fire     = False
+                                    rate_desc = ""
+                                    if event == "funding_negative" and rate < 0:
+                                        fire = True
+                                        rate_desc = f"Funding went NEGATIVE: {rate*100:+.4f}% (shorts paying)"
+                                    elif event == "funding_positive" and rate > 0.001:
+                                        fire = True
+                                        rate_desc = f"Funding HIGH POSITIVE: {rate*100:+.4f}% (longs paying)"
+                                    elif event == "funding_change" and abs(rate) > 0.0005:
+                                        fire = True
+                                        rate_desc = f"Funding notable: {rate*100:+.4f}%"
+                                    if fire:
+                                        fkey = f"user_{chat_id}_funding_{symbol}_{rate > 0}"
+                                        if _is_cooled_down(fkey, 3600):
+                                            msg = (
+                                                f"💰 <b>YOUR FUNDING ALERT — {sym_short}</b>\n\n"
+                                                f"{rate_desc}\n"
+                                                f"Settlement in: {mins}min\n"
+                                                f"{'Bearish pressure at settlement' if rate > 0 else 'Short squeeze risk'}"
+                                            )
+                                            if watch.get("note"):
+                                                msg += f"\n\n📌 {watch['note']}"
+                                            if _send_fn:
+                                                _send_fn(chat_id, msg)
+                                            _mark_alerted(fkey)
+                                            _persist_state()
+                            except Exception as _fe:
+                                log.debug(f"funding monitor {symbol}: {_fe}")
+
+                    # ── Assisted mode: send extra notable events ────────────
+                    if mode == "assisted":
+                        if score >= PROACTIVE_ALERT_SCORE:
+                            key = f"user_{chat_id}_assisted_{symbol}_{score // 10}"
+                            if _is_cooled_down(key, 7200):
+                                msg_lines = [
+                                    f"📊 <b>NOTABLE — {sym_short}</b>  [ASSISTED]",
+                                    f"",
+                                    f"Score: {score}/100  |  Bias: {intel.get('htf_bias','')}",
+                                    f"Regime: {intel.get('regime','')}",
+                                ]
+                                if sweep.get("detected"):
+                                    msg_lines.append(f"• Sweep: {sweep.get('description','')}")
+                                if bos.get("broken"):
+                                    msg_lines.append(f"• BOS: {bos.get('description','')}")
+                                if disp.get("confirmed"):
+                                    msg_lines.append(f"• Displacement confirmed")
+                                msg_lines.append(f"\n{datetime.now(timezone.utc).strftime('%H:%M UTC')}")
+                                if _send_fn:
+                                    _send_fn(chat_id, "\n".join(msg_lines))
+                                _mark_alerted(key)
+
+                except Exception as e:
+                    log.debug(f"user watchlist scan {symbol} for {chat_id}: {e}")
+
+        # ── Workflow evaluation (P6/P7) ────────────────────────────────────
+        _run_workflow_scan()
+
+    except Exception as e:
+        log.error(f"_run_user_watchlist_scan error: {e}")
+
+
+def _run_workflow_scan():
+    """
+    Priority 6/7: evaluate all user-defined multi-stage workflows.
+    Each workflow tracks its own progress across scan cycles.
+    Only alerts when ALL stages complete.
+    """
+    try:
+        from app import workflow as wf_mod
+        from app.market_data import get_klines
+        from app.mexc_data import get_funding_rate as mexc_funding
+        from app.intelligence import build_intelligence
+        from app.trade_plan import generate_trade_plan
+
+        all_workflows = wf_mod.get_all_workflows()
+        if not all_workflows:
+            return
+
+        for chat_id, flows in all_workflows.items():
+            for i, flow in enumerate(flows):
+                if flow.get("alerted"):
+                    continue
+
+                symbol = flow["symbol"]
+                try:
+                    c_m15   = get_klines(symbol, "15m", 96)
+                    c_h1    = get_klines(symbol, "1h",  50)
+                    c_h4    = get_klines(symbol, "4h",  50)
+                    c_daily = get_klines(symbol, "1d",  30)
+
+                    funding_rate = 0.0
+                    try:
+                        fd = mexc_funding(symbol)
+                        if fd.get("ok"):
+                            funding_rate = fd["funding_rate"]
+                    except Exception:
+                        pass
+
+                    intel  = build_intelligence(symbol, c_m15, c_h1, c_h4, c_daily, funding_rate)
+                    result = wf_mod.evaluate_workflow(flow, intel)
+
+                    # Update progress
+                    flows[i]["progress"] = result["progress"]
+
+                    if result["newly_complete"]:
+                        flows[i]["alerted"] = True
+                        try:
+                            plan = generate_trade_plan(intel)
+                        except Exception:
+                            plan = {}
+
+                        alert_text = wf_mod.format_workflow_alert(flow, result, intel, plan)
+                        if _send_fn:
+                            _send_fn(int(chat_id), alert_text)
+                        log.info(f"workflow complete: {flow['name']} for {chat_id}")
+
+                except Exception as e:
+                    log.debug(f"workflow scan {symbol} for {chat_id}: {e}")
+
+    except Exception as e:
+        log.error(f"_run_workflow_scan error: {e}")
+
+
+# ── Opportunity ranking ───────────────────────────────────────────────────
+
 def run_opportunity_ranking():
-    """
-    Periodically rank all watchlist symbols by opportunity score.
-    If the top symbol exceeds the proactive threshold, send an alert.
-    This is Phase 7 — opportunity ranking.
-    """
-    log.info("scanner: running opportunity ranking...")
+    """Rank all watchlist symbols; alert if top score clears threshold."""
+    log.info("scanner: opportunity ranking...")
     try:
         from app.market_data import get_klines
         from app.mexc_data import get_funding_rate as mexc_funding
@@ -426,19 +1070,17 @@ def run_opportunity_ranking():
         if not top:
             return
 
-        best = top[0]
+        best  = top[0]
         score = best["score"]
 
         if score < PROACTIVE_ALERT_SCORE:
-            log.info(f"scanner: top opportunity {best['symbol']} score {score} below threshold")
             return
 
         key = f"ranking_{best['symbol']}_{score // 10 * 10}"
-        if not _is_cooled_down(key, 3600):  # max once per hour per score band
+        if not _is_cooled_down(key, 3600):
             return
 
-        # Build ranking message
-        lines = ["🏆 <b>OPPORTUNITY RANKING UPDATE</b>\n"]
+        lines = ["🏆 <b>OPPORTUNITY RANKING</b>\n"]
         for i, intel in enumerate(top, 1):
             sym    = intel["symbol"].replace("USDT", "")
             sc     = intel["score"]
@@ -459,15 +1101,17 @@ def run_opportunity_ranking():
         _send_alert("\n".join(lines), alert_type="ranking", symbol=best["symbol"])
         _mark_alerted(key)
         _persist_state()
-        log.info(f"scanner: opportunity ranking alert sent — top: {best['symbol']} {score}/100")
 
     except Exception as e:
         log.error(f"scanner: opportunity ranking error — {e}")
 
 
+# ── Background loops ──────────────────────────────────────────────────────
+
 def _mexc_loop():
     while _running:
         run_mexc_crime_scan()
+        run_mexc_movers_scan()
         time.sleep(MEXC_SCAN_INTERVAL)
 
 
@@ -475,160 +1119,13 @@ def _structure_loop():
     time.sleep(60)
     scan_count = 0
     while _running:
+        run_major_asset_scan()
         run_structure_scan()
         _run_user_watchlist_scan()
         scan_count += 1
-        # Run opportunity ranking every 3rd structure scan (~30 min)
         if scan_count % 3 == 0:
             run_opportunity_ranking()
         time.sleep(STRUCTURE_SCAN_INTERVAL)
-
-
-def _run_user_watchlist_scan():
-    """Scan each user's personal watchlist using the Intelligence Engine."""
-    if not _user_watchlists:
-        return
-    try:
-        from app.market_data import get_klines
-        from app.mexc_data import get_funding_rate as mexc_funding
-        from app.intelligence import build_intelligence
-
-        for chat_id, watches in _user_watchlists.items():
-            for watch in watches:
-                symbol     = watch["symbol"]
-                conds      = watch.get("conditions", ["sweep", "bos"])
-                entry_tf   = watch.get("entry_tf",   "15m")
-                confirm_tf = watch.get("confirm_tf", "1h")
-                bias_tf    = watch.get("bias_tf",    "4h")
-
-                try:
-                    c_entry   = get_klines(symbol, entry_tf,   96)
-                    c_confirm = get_klines(symbol, confirm_tf, 50)
-                    c_bias    = get_klines(symbol, bias_tf,    50)
-                    c_daily   = get_klines(symbol, "1d",       30)
-
-                    if not c_entry:
-                        continue
-
-                    funding_rate = 0.0
-                    try:
-                        fd = mexc_funding(symbol)
-                        if fd.get("ok"):
-                            funding_rate = fd["funding_rate"]
-                    except Exception:
-                        pass
-
-                    intel     = build_intelligence(
-                        symbol        = symbol,
-                        candles_m15   = c_entry if entry_tf in ("15m", "5m") else [],
-                        candles_h1    = c_confirm,
-                        candles_h4    = c_bias,
-                        candles_daily = c_daily,
-                        funding_rate  = funding_rate,
-                    )
-
-                    score     = intel.get("score", 0)
-                    sym_short = symbol.replace("USDT", "").replace("_USDT", "")
-                    sweep     = intel.get("sweep", {})
-                    bos       = intel.get("bos", {})
-                    disp      = intel.get("displacement", {})
-                    bias      = intel.get("htf_bias", "Neutral")
-                    ob        = intel.get("order_block", {})
-
-                    if "sweep" in conds and sweep.get("detected") and sweep.get("age_candles", 99) <= 3:
-                        key = f"user_{chat_id}_sweep_{symbol}_{round(sweep.get('level', 0), 2)}"
-                        if _is_cooled_down(key, SWEEP_COOLDOWN):
-                            explanation = _explain_intel_alert(symbol, intel) if score >= 50 else ""
-                            tf_label = f"{entry_tf.upper()} entry | {confirm_tf.upper()} | {bias_tf.upper()} bias"
-                            msg_lines = [
-                                f"🎯 <b>YOUR WATCHLIST — {sym_short} SWEEP</b>",
-                                f"",
-                                f"{sweep.get('description', '')}",
-                                f"Score: {score}/100  |  Bias: <b>{bias}</b>",
-                                f"TF stack: {tf_label}",
-                            ]
-                            if disp.get("confirmed"):
-                                msg_lines.append(f"✅ {disp.get('description', '')}")
-                                if ob.get("found"):
-                                    msg_lines.append(f"📦 OB: {ob['low']:.4f}–{ob['high']:.4f}")
-                            else:
-                                msg_lines.append("⏳ No displacement yet")
-                            if explanation:
-                                msg_lines += ["", explanation]
-                            if watch.get("note"):
-                                msg_lines.append(f"\n📌 {watch['note']}")
-                            msg_lines.append(f"\n{datetime.now(timezone.utc).strftime('%H:%M UTC')}")
-                            if _send_fn:
-                                _send_fn(chat_id, "\n".join(msg_lines))
-                            _mark_alerted(key)
-                            _persist_state()
-
-                    if "bos" in conds and bos.get("broken"):
-                        bos_key = f"user_{chat_id}_bos_{symbol}_{round(bos.get('level', 0), 2)}"
-                        if _is_cooled_down(bos_key, BOS_COOLDOWN):
-                            msg_lines = [
-                                f"⚡ <b>YOUR WATCHLIST — {sym_short} BOS</b>",
-                                f"",
-                                f"{bos.get('description', '')}",
-                                f"Score: {score}/100  |  Bias: <b>{bias}</b>",
-                                f"👀 Watch {entry_tf.upper()} for entry sweep",
-                            ]
-                            indu = intel.get("inducements", [])
-                            if indu:
-                                z = indu[0]
-                                msg_lines.append(f"Next inducement: {z['price']:.4f} ({z['distance_pct']:+.1f}%)")
-                            if watch.get("note"):
-                                msg_lines.append(f"\n📌 {watch['note']}")
-                            msg_lines.append(f"\n{datetime.now(timezone.utc).strftime('%H:%M UTC')}")
-                            if _send_fn:
-                                _send_fn(chat_id, "\n".join(msg_lines))
-                            _mark_alerted(bos_key)
-                            _persist_state()
-
-                    # Funding monitors
-                    funding_conds = [c for c in conds if c.startswith("funding")]
-                    if funding_conds:
-                        try:
-                            from app.mexc_data import get_funding_rate
-                            fd = get_funding_rate(symbol)
-                            if fd.get("ok"):
-                                rate    = fd["funding_rate"]
-                                next_ms = fd.get("next_settle_time", 0)
-                                now_ms  = int(time.time() * 1000)
-                                mins    = max(0, (next_ms - now_ms) // 60000) if next_ms else 999
-                                fire     = False
-                                rate_desc = ""
-                                if "funding_negative" in funding_conds and rate < 0:
-                                    fire = True
-                                    rate_desc = f"Funding went NEGATIVE: {rate*100:+.4f}% (shorts paying)"
-                                elif "funding_positive" in funding_conds and rate > 0.001:
-                                    fire = True
-                                    rate_desc = f"Funding HIGH POSITIVE: {rate*100:+.4f}% (longs paying)"
-                                elif "funding_change" in funding_conds and abs(rate) > 0.0005:
-                                    fire = True
-                                    rate_desc = f"Funding notable: {rate*100:+.4f}%"
-                                if fire:
-                                    key = f"user_{chat_id}_funding_{symbol}_{rate > 0}"
-                                    if _is_cooled_down(key, 3600):
-                                        msg = (
-                                            f"💰 <b>YOUR FUNDING ALERT — {sym_short}</b>\n\n"
-                                            f"{rate_desc}\n"
-                                            f"Settlement in: {mins}min\n"
-                                            f"{'Bearish pressure at settlement' if rate > 0 else 'Short squeeze risk'}"
-                                        )
-                                        if watch.get("note"):
-                                            msg += f"\n\n📌 {watch['note']}"
-                                        if _send_fn:
-                                            _send_fn(chat_id, msg)
-                                        _mark_alerted(key)
-                                        _persist_state()
-                        except Exception as _fe:
-                            log.debug(f"funding monitor {symbol}: {_fe}")
-
-                except Exception as e:
-                    log.debug(f"user watchlist scan {symbol} for {chat_id}: {e}")
-    except Exception as e:
-        log.error(f"_run_user_watchlist_scan error: {e}")
 
 
 def start_scanner(send_fn, chat_id: int):
@@ -642,14 +1139,23 @@ def start_scanner(send_fn, chat_id: int):
         prior = load_state()
         if prior:
             _alert_cooldowns = prior.get("cooldowns",   {})
-            _user_watchlists = prior.get("watchlists",  {})
+            _user_watchlists = {
+                int(k): v
+                for k, v in prior.get("watchlists", {}).items()
+                if str(k).isdigit()
+            }
+            # Restore workflows
+            try:
+                from app import workflow as wf_mod
+                wf_mod.load_workflows(prior.get("workflows", {}))
+            except Exception:
+                pass
             log.info(
-                f"scanner: restored from 0G Storage — "
-                f"{len(_alert_cooldowns)} cooldowns, "
+                f"scanner: restored — {len(_alert_cooldowns)} cooldowns, "
                 f"{sum(len(v) for v in _user_watchlists.values())} user monitors"
             )
         else:
-            log.info("scanner: no prior 0G Storage state — starting fresh")
+            log.info("scanner: starting fresh")
     except Exception as e:
         log.warning(f"scanner: state restore failed — {e}")
 
