@@ -236,6 +236,13 @@ def _parse_monitor_request(text: str) -> dict | None:
 
 # ── Fetch MEXC tickers (used by /crimes) ─────────────────────────────────
 
+_NON_CRYPTO_BOT = {
+    "stock", "xau", "xag", "usd_", "eur", "gbp", "jpy", "aud",
+    "chf", "cad", "nzd", "oil", "gas", "corn", "wheat", "sp500",
+    "nasdaq", "dow", "gold", "silver",
+}
+
+
 def _fetch_mexc_tickers() -> list:
     resp = requests.get(
         "https://contract.mexc.com/api/v1/contract/ticker",
@@ -249,18 +256,32 @@ def _fetch_mexc_tickers() -> list:
         sym = t.get("symbol", "")
         if not sym.endswith("_USDT"):
             continue
+        # Filter: crypto perpetuals only — no stocks, forex, commodities
+        if any(s in sym.lower() for s in _NON_CRYPTO_BOT):
+            continue
+
+        # Robust change % parsing
         change_pct = None
-        for field in ("priceChangePercent", "changeRate", "riseFallRate", "priceChange24h"):
+        for field in ("priceChangePercent",):
             val = t.get(field)
             if val is not None:
                 try:
                     fval = float(val)
-                    if abs(fval) < 1.5 and fval != 0:
+                    if abs(fval) < 2.0 and fval != 0:
                         fval *= 100
                     change_pct = fval
                     break
                 except (ValueError, TypeError):
                     continue
+        if change_pct is None:
+            for field in ("changeRate", "riseFallRate"):
+                val = t.get(field)
+                if val is not None:
+                    try:
+                        change_pct = float(val) * 100
+                        break
+                    except (ValueError, TypeError):
+                        continue
         if change_pct is None:
             try:
                 last  = float(t.get("lastPrice", 0))
@@ -360,6 +381,17 @@ def handle_update(update: dict) -> None:
         )
         return
 
+    # ── /pause / /resume (Fix 2) ──────────────────────────────────────────
+    if text.startswith("/pause"):
+        from app.scanner import pause_alerts
+        send_message(chat_id, pause_alerts(chat_id))
+        return
+
+    if text.startswith("/resume"):
+        from app.scanner import resume_alerts
+        send_message(chat_id, resume_alerts(chat_id))
+        return
+
     # ── /setups / /opportunities — Priority 13 ────────────────────────────
     if text.startswith(("/setups", "/opportunities", "/opp")):
         send_message(chat_id, "⚡ Ranking setups... scanning market structure (~45s)")
@@ -388,6 +420,12 @@ def handle_update(update: dict) -> None:
     # ── /crimes — Priorities 10 + 11 ──────────────────────────────────────
     if text.startswith("/crimes"):
         send_message(chat_id, "🔍 Fetching MEXC top movers...")
+        # Fix 1: stamp so background movers scan skips next cycle
+        try:
+            from app.scanner import stamp_manual_crimes
+            stamp_manual_crimes()
+        except Exception:
+            pass
         try:
             tickers = _fetch_mexc_tickers()
             if not tickers:

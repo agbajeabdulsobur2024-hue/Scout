@@ -214,21 +214,85 @@ def explain_structure(symbol: str) -> str:
 
 # ── best_opportunities — P13: auto-ranked setups with full plans ──────────
 
+def _get_mexc_mover_symbols(min_change: float = 5.0, max_symbols: int = 20) -> list:
+    """
+    Pull current MEXC top movers and return their symbols for setup scanning.
+    Filters out stocks/forex/commodities. Only returns crypto perps with
+    a meaningful move so we focus on active momentum.
+    """
+    try:
+        import requests
+        _NON_CRYPTO = {
+            "stock", "xau", "xag", "usd_", "eur", "gbp", "jpy", "aud",
+            "chf", "cad", "nzd", "oil", "gas", "corn", "wheat", "sp500",
+            "nasdaq", "dow", "gold", "silver",
+        }
+        resp = requests.get(
+            "https://contract.mexc.com/api/v1/contract/ticker", timeout=15
+        )
+        resp.raise_for_status()
+        raw = resp.json().get("data", [])
+
+        movers = []
+        for t in raw:
+            sym = t.get("symbol", "")
+            if not sym.endswith("_USDT"):
+                continue
+            if any(s in sym.lower() for s in _NON_CRYPTO):
+                continue
+            try:
+                last  = float(t.get("lastPrice", 0))
+                open_ = float(t.get("open24h", t.get("openPrice", 0)))
+                if last > 0 and open_ > 0:
+                    chg = abs((last - open_) / open_ * 100)
+                else:
+                    raw_pct = t.get("priceChangePercent", t.get("changeRate", 0))
+                    chg = abs(float(raw_pct or 0))
+                    if chg < 2.0:
+                        chg *= 100
+                if chg >= min_change:
+                    movers.append((sym.replace("_USDT", "") + "USDT", chg))
+            except (ValueError, TypeError):
+                continue
+
+        # Sort by magnitude, take top N
+        movers.sort(key=lambda x: x[1], reverse=True)
+        return [m[0] for m in movers[:max_symbols]]
+    except Exception as e:
+        log.debug(f"_get_mexc_mover_symbols failed: {e}")
+        return []
+
+
+# Grade thresholds
+GRADE_A_PLUS = 78
+GRADE_A      = 62
+
+
 def best_opportunities(symbols: list = None, top_n: int = 5) -> str:
     """
-    P13: Rank all watchlist symbols, generate full trade plans for top results.
-    Output: ranked header + full setup for each (entry/SL/TP1/TP2/RR/confluence).
-    P14: Rich output — no bare event names, always actionable.
+    P13: Scan majors + MEXC movers for A/A+ setups.
+    - A+: score ≥ 78 — full trade plan
+    - A:  score ≥ 62 — trade plan
+    - Below A: omitted from output
+
+    Always includes MEXC top movers (≥5% move) alongside the default watchlist
+    so we catch active momentum names, not just majors.
     """
     from app.market_data import get_klines, DEFAULT_WATCHLIST
     from app.mexc_data import get_funding_rate as mexc_funding
     from app.trade_plan import generate_trade_plan, format_trade_plan
 
-    symbols     = symbols or DEFAULT_WATCHLIST
+    # Combine default watchlist + live MEXC movers
+    base_symbols  = symbols or DEFAULT_WATCHLIST
+    mover_symbols = _get_mexc_mover_symbols(min_change=5.0, max_symbols=20)
+
+    # Deduplicate, movers first (they're active momentum names)
+    all_symbols = list(dict.fromkeys(mover_symbols + base_symbols))
+
     candles_map = {}
     funding_map = {}
 
-    for sym in symbols:
+    for sym in all_symbols:
         try:
             candles_map[sym] = {
                 "m15":   get_klines(sym, "15m", 96),
@@ -246,74 +310,107 @@ def best_opportunities(symbols: list = None, top_n: int = 5) -> str:
         except Exception:
             pass
 
-    top = rank_opportunities(symbols, candles_map, funding_map, top_n=top_n)
+    top = rank_opportunities(all_symbols, candles_map, funding_map, top_n=top_n)
 
     if not top:
         return (
-            "No confirmed structure setups across the watchlist right now.\n"
-            "Scanner checks every 10 minutes — you'll get an alert when one forms."
+            "No A/A+ setups found right now across majors + MEXC movers.\n\n"
+            "Scout scanned the full market including active movers. "
+            "Nothing cleared the minimum confluence threshold.\n"
+            "You'll get an alert automatically when a setup forms."
         )
 
-    # ── Ranking header ────────────────────────────────────────────────────
-    ICONS = {"🟢": 75, "🟡": 50}
-    header_lines = ["<b>🏆 Setup Ranking</b>\n"]
-    for i, intel in enumerate(top, 1):
+    # ── Grade each result ─────────────────────────────────────────────────
+    graded = []
+    for intel in top:
+        score = intel["score"]
+        if score >= GRADE_A_PLUS:
+            grade = "A+"
+        elif score >= GRADE_A:
+            grade = "A"
+        else:
+            grade = "B"
+        graded.append((grade, intel))
+
+    a_plus = [(g, i) for g, i in graded if g == "A+"]
+    a_only = [(g, i) for g, i in graded if g == "A"]
+    b_only = [(g, i) for g, i in graded if g == "B"]
+
+    # ── Header ────────────────────────────────────────────────────────────
+    total_scanned = len(all_symbols)
+    header_lines  = [
+        f"<b>🏆 Setup Ranking</b>",
+        f"<i>Scanned {total_scanned} symbols — majors + MEXC movers</i>\n",
+    ]
+
+    for i, (grade, intel) in enumerate(graded, 1):
         sym    = intel["symbol"].replace("USDT", "")
         score  = intel["score"]
         bias   = intel["htf_bias"]
         regime = intel["regime"]
-        icon   = "🟢" if score >= 75 else "🟡" if score >= 50 else "🔴"
+        icon   = "🟢" if grade == "A+" else "🟡" if grade == "A" else "⚪"
 
         sigs = []
-        if intel.get("sweep", {}).get("detected"):
-            sigs.append("sweep")
-        if intel.get("displacement", {}).get("confirmed"):
-            sigs.append("disp")
-        if intel.get("bos", {}).get("broken"):
-            sigs.append("BOS")
-        if intel.get("order_block", {}).get("found"):
-            sigs.append("OB")
-        sig_str = " + ".join(sigs) if sigs else "monitoring"
+        if intel.get("sweep", {}).get("detected"):    sigs.append("sweep")
+        if intel.get("displacement", {}).get("confirmed"): sigs.append("disp")
+        if intel.get("bos", {}).get("broken"):        sigs.append("BOS")
+        if intel.get("order_block", {}).get("found"): sigs.append("OB")
+        if intel.get("fvg", {}).get("found"):         sigs.append("FVG")
+        sig_str = " + ".join(sigs) if sigs else "partial"
 
         header_lines.append(
-            f"{icon} {i}. <b>{sym}</b>  {score}/100  ({bias} | {regime})\n"
-            f"   {sig_str}"
+            f"{icon} {i}. <b>{sym}</b>  [{grade}]  {score}/100\n"
+            f"   {bias} | {regime} | {sig_str}"
         )
 
     header = "\n".join(header_lines)
 
-    # ── Full trade plans for each top symbol ──────────────────────────────
+    # ── Full trade plans — A+ and A only ─────────────────────────────────
     plan_blocks = []
-    for intel in top:
+    for grade, intel in (a_plus + a_only):
         sym_short = intel["symbol"].replace("USDT", "")
         plan      = generate_trade_plan(intel)
         if plan.get("error"):
-            plan_blocks.append(f"<b>{sym_short}</b>: No trade plan — {plan['error']}")
+            plan_blocks.append(
+                f"<b>{sym_short} [{grade}]</b>: Structure confirmed — "
+                f"no clean entry zone yet. {plan['error']}"
+            )
         else:
-            plan_blocks.append(format_trade_plan(plan))
+            plan_blocks.append(
+                f"— — — — — — — — — —\n"
+                f"{format_trade_plan(plan)}"
+            )
 
-    plans_text = "\n\n".join(plan_blocks)
+    if b_only:
+        plan_blocks.append(
+            f"\n<i>⚪ {len(b_only)} B-grade setup(s) below A threshold — "
+            f"monitoring continues.</i>"
+        )
 
-    # ── 0G Compute context explanation ────────────────────────────────────
-    intel_blocks = [format_intelligence_for_model(i) for i in top]
-    context = "\n\n---\n\n".join(intel_blocks)
+    plans_text = "\n\n".join(plan_blocks) if plan_blocks else ""
 
-    question = (
-        "These are the top-ranked SMC opportunities right now. "
-        "For each symbol, give ONE sentence explaining WHY it ranks here — "
-        "what specific evidence makes it notable. "
-        "Reference only the intelligence data provided. "
-        "No general commentary. No invented levels."
-    )
+    # ── 0G Compute explanation — A/A+ only ───────────────────────────────
+    top_intel    = [i for _, i in (a_plus + a_only)]
+    intel_blocks = [format_intelligence_for_model(i) for i in top_intel]
+    context      = "\n\n---\n\n".join(intel_blocks) if intel_blocks else ""
 
-    try:
-        explanation = ask([
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": f"{context}\n\n{question}"},
-        ], max_tokens=400)
-        return f"{header}\n\n{plans_text}\n\n{explanation}"
-    except ZGComputeError as e:
-        return f"{header}\n\n{plans_text}\n\n⚠️ 0G Compute unavailable: {e}"
+    if context:
+        question = (
+            "These are A and A+ grade SMC setups from majors and MEXC movers. "
+            "For each symbol write ONE sentence: what specific confluence "
+            "makes this actionable right now. "
+            "Reference only supplied data. No invented levels. No filler."
+        )
+        try:
+            explanation = ask([
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user",   "content": f"{context}\n\n{question}"},
+            ], max_tokens=350)
+            return f"{header}\n\n{plans_text}\n\n{explanation}"
+        except ZGComputeError as e:
+            return f"{header}\n\n{plans_text}\n\n⚠️ 0G Compute unavailable: {e}"
+
+    return f"{header}\n\n{plans_text}" if plans_text else header
 
 
 # ── explain_crime_move — P14: rich context on MEXC movers ────────────────

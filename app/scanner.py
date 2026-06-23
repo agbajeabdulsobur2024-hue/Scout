@@ -50,6 +50,16 @@ _send_fn         = None
 _chat_id         = None
 _running         = False
 
+# ── Pause state — per chat_id (Fix 2) ────────────────────────────────────
+# When paused, background scanner sends no alerts to that chat.
+_paused_chats: set = set()
+
+# ── Manual /crimes dedup stamp (Fix 1) ───────────────────────────────────
+# When user calls /crimes manually, we stamp this time so the background
+# movers scan skips sending individual alerts for the same cycle.
+_last_manual_crimes: float = 0.0
+MANUAL_CRIMES_SUPPRESS_WINDOW = 120  # seconds — suppress background movers for 2 min after /crimes
+
 # ── User monitor watchlists ────────────────────────────────────────────────
 # Strict: {symbol, direction, event, tf, ...} — direction-aware (P1)
 _user_watchlists: dict = {}
@@ -202,6 +212,42 @@ def _mark_alerted(key: str):
     _alert_cooldowns[key] = time.time()
 
 
+# ── Pause / resume (Fix 2) ───────────────────────────────────────────────
+
+def pause_alerts(chat_id: int) -> str:
+    """Pause all background alerts for this chat."""
+    _paused_chats.add(chat_id)
+    return (
+        "⏸ Background alerts paused.\n\n"
+        "Scout is still monitoring — no alerts will be sent until you resume.\n"
+        "Use /resume to turn alerts back on."
+    )
+
+
+def resume_alerts(chat_id: int) -> str:
+    """Resume background alerts for this chat."""
+    _paused_chats.discard(chat_id)
+    return "▶️ Alerts resumed. Scout is back on watch."
+
+
+def is_paused(chat_id: int) -> bool:
+    return chat_id in _paused_chats
+
+
+def stamp_manual_crimes():
+    """
+    Call this when user manually runs /crimes.
+    Suppresses background mover alerts for the next 2 minutes to avoid
+    flooding the same information twice. (Fix 1)
+    """
+    global _last_manual_crimes
+    _last_manual_crimes = time.time()
+
+
+def _manual_crimes_active() -> bool:
+    return time.time() - _last_manual_crimes < MANUAL_CRIMES_SUPPRESS_WINDOW
+
+
 # ── Persistence ───────────────────────────────────────────────────────────
 
 def _persist_state():
@@ -217,10 +263,14 @@ def _persist_state():
 
 def _send_alert(text: str, alert_type: str = "alert", symbol: str = ""):
     if _send_fn and _chat_id:
-        try:
-            _send_fn(_chat_id, text)
-        except Exception as e:
-            log.error(f"scanner: alert send failed — {e}")
+        # Fix 2: respect pause state
+        if _chat_id in _paused_chats:
+            log.debug(f"scanner: alert suppressed — chat {_chat_id} is paused")
+        else:
+            try:
+                _send_fn(_chat_id, text)
+            except Exception as e:
+                log.error(f"scanner: alert send failed — {e}")
     try:
         from app.zg_storage import append_alert_log
         append_alert_log({
@@ -388,6 +438,55 @@ def get_major_summary() -> str:
 
 # ── MEXC gainers/losers scanner (Priorities 10 + 11) ─────────────────────
 
+_NON_CRYPTO = {
+    "stock", "xau", "xag", "usd_", "eur", "gbp", "jpy", "aud",
+    "chf", "cad", "nzd", "oil", "gas", "corn", "wheat", "sp500",
+    "nasdaq", "dow", "gold", "silver",
+}
+
+
+def _is_crypto_perp(sym: str) -> bool:
+    """Fix 3: filter out stocks, forex, and commodities — crypto only."""
+    sym_lower = sym.lower()
+    return not any(s in sym_lower for s in _NON_CRYPTO)
+
+
+def _parse_change_pct(t: dict) -> float | None:
+    """
+    Robust 24h change % parser — handles all MEXC API field variants.
+    priceChangePercent (%), changeRate (decimal), riseFallRate (decimal),
+    or computed from lastPrice / open24h.
+    """
+    for field in ("priceChangePercent",):
+        val = t.get(field)
+        if val is not None:
+            try:
+                fval = float(val)
+                if abs(fval) < 2.0 and fval != 0:
+                    fval *= 100
+                return fval
+            except (ValueError, TypeError):
+                pass
+
+    for field in ("changeRate", "riseFallRate"):
+        val = t.get(field)
+        if val is not None:
+            try:
+                return float(val) * 100
+            except (ValueError, TypeError):
+                pass
+
+    try:
+        last  = float(t.get("lastPrice", 0))
+        open_ = float(t.get("open24h", t.get("openPrice", t.get("open", 0))))
+        if last > 0 and open_ > 0:
+            return round((last - open_) / open_ * 100, 4)
+    except (ValueError, TypeError):
+        pass
+
+    return None
+
+
 def _fetch_mexc_tickers() -> list:
     import requests
     resp = requests.get("https://contract.mexc.com/api/v1/contract/ticker", timeout=15)
@@ -398,27 +497,14 @@ def _fetch_mexc_tickers() -> list:
         sym = t.get("symbol", "")
         if not sym.endswith("_USDT"):
             continue
-        change_pct = None
-        for field in ("priceChangePercent", "changeRate", "riseFallRate", "priceChange24h"):
-            val = t.get(field)
-            if val is not None:
-                try:
-                    fval = float(val)
-                    if abs(fval) < 1.5 and fval != 0:
-                        fval *= 100
-                    change_pct = fval
-                    break
-                except (ValueError, TypeError):
-                    continue
+        # Fix 3: skip non-crypto assets
+        if not _is_crypto_perp(sym):
+            continue
+        change_pct = _parse_change_pct(t)
         if change_pct is None:
-            try:
-                last  = float(t.get("lastPrice", 0))
-                open_ = float(t.get("open24h", t.get("openPrice", 0)))
-                if open_ > 0 and last > 0:
-                    change_pct = (last - open_) / open_ * 100
-            except Exception:
-                pass
-        if change_pct is None:
+            continue
+        # Skip near-zero moves — noise
+        if abs(change_pct) < 0.01:
             continue
         try:
             tickers.append({
@@ -480,8 +566,15 @@ def run_mexc_movers_scan():
     Priorities 10 + 11: scan MEXC for +/-5/10/15% movers.
     Alert with classification (continuation vs exhaustion for gainers,
     capitulation vs reversal for losers).
+
+    Fix 1: suppressed for 2 minutes after user manually calls /crimes,
+    to avoid flooding duplicate information.
     """
     log.info("scanner: MEXC movers scan...")
+    # Fix 1: skip if user just ran /crimes manually
+    if _manual_crimes_active():
+        log.debug("scanner: movers scan suppressed — /crimes was just called manually")
+        return
     try:
         tickers = _fetch_mexc_tickers()
         if not tickers:
