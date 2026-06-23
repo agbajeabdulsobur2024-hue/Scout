@@ -110,14 +110,18 @@ def _extract_tf(text_lower: str) -> str:
 
 def _extract_symbol(text: str) -> str:
     STOPWORDS = {
-        "monitor", "watch", "alert", "track", "me", "and", "for", "when",
-        "the", "get", "all", "now", "this", "that", "with", "from", "any",
-        "new", "goes", "can", "you", "then", "also", "wait", "tell", "let",
-        "know", "if", "see", "on", "h4", "1h", "4h", "15m", "step", "first",
-        "second", "third", "bearish", "bullish", "short", "long", "at", "in",
-        "after", "until", "once", "time", "move", "price", "bias", "regime",
-        "sweep", "bos", "choch", "ob", "fvg", "break", "structure", "block",
-        "order", "fair", "value", "gap", "change", "character", "displacement",
+        "monitor", "watch", "watching", "alert", "track", "tracking", "me",
+        "and", "for", "when", "the", "get", "all", "now", "this", "that",
+        "with", "from", "any", "new", "goes", "can", "you", "then", "also",
+        "wait", "tell", "let", "know", "if", "see", "on", "h4", "1h", "4h",
+        "15m", "step", "first", "second", "third", "bearish", "bullish",
+        "short", "long", "at", "in", "after", "until", "once", "time", "move",
+        "price", "bias", "regime", "sweep", "bos", "choch", "ob", "fvg",
+        "break", "structure", "block", "order", "fair", "value", "gap",
+        "change", "character", "displacement",
+        # Action words that appear in remove/stop phrases
+        "stop", "remove", "unwatch", "cancel", "delete", "please",
+        "just", "no", "not", "longer", "more", "pause", "resume",
     }
     for word in re.findall(r'\b[A-Za-z]{2,10}\b', text):
         if word.lower() not in STOPWORDS:
@@ -197,9 +201,16 @@ def _parse_monitor_request(text: str) -> dict | None:
 
     # ── Remove request ────────────────────────────────────────────────────
     if any(w in text_lower for w in _REMOVE_TRIGGERS):
-        sym_match = re.search(r'\b([A-Za-z]{2,10})(usdt|USDT)?\b', text, re.IGNORECASE)
-        if sym_match:
-            return {"action": "remove", "symbol": sym_match.group(1).upper()}
+        # Skip action/verb words and grab the actual ticker symbol.
+        # e.g. "stop watching SYN" -> SYN, not "STOP"
+        _REMOVE_STOPWORDS = {
+            "stop", "remove", "unwatch", "cancel", "delete", "watching",
+            "monitoring", "tracking", "watch", "monitor", "track", "please",
+            "just", "no", "not", "longer", "more", "my", "the", "a", "an",
+        }
+        for word in re.findall(r'\b([A-Za-z]{2,10})\b', text):
+            if word.lower() not in _REMOVE_STOPWORDS:
+                return {"action": "remove", "symbol": word.upper()}
         return None
 
     # ── Must be a monitor trigger ─────────────────────────────────────────
@@ -325,28 +336,37 @@ def handle_update(update: dict) -> None:
         send_message(chat_id,
             "I'm <b>Scout</b> — your personal SMC trading assistant.\n\n"
             "I monitor markets 24/7 and alert you <b>only when meaningful conditions occur</b>.\n\n"
-            "<b>Commands:</b>\n"
-            "/setups — ranked SMC setups with full trade plans\n"
+            "<b>📊 Market</b>\n"
+            "/setups — ranked A/A+ setups across majors + MEXC movers\n"
             "/majors — BTC, ETH, SOL, TON, BNB, XRP, SUI snapshot\n"
-            "/scan — structure scan across watchlist\n"
-            "/bias SOL — full SMC picture for any symbol\n"
-            "/crimes — MEXC top gainers + losers\n"
-            "/movers — MEXC quick top 5\n"
-            "/funding BTC — funding rate intelligence\n"
-            "/watchlist — your active monitors\n"
-            "/workflows — your active custom workflows\n"
+            "/crimes — MEXC top 20 gainers + losers\n"
+            "/movers — top 5 movers quick view\n"
+            "/scan — run structure scan now\n\n"
+            "<b>🔍 Analysis</b>\n"
+            "/bias SOL — full SMC analysis for any symbol\n"
+            "/funding BTC — funding rate intelligence\n\n"
+            "<b>📋 Your monitors</b>\n"
+            "/watchlist — view active monitors\n"
+            "/workflows — view active custom workflows\n"
+            "/clearwatchlist — remove all monitors + workflows\n"
             "/history — past alert log\n\n"
-            "<b>Monitor (strict — direction-aware):</b>\n"
+            "<b>⏸ Control</b>\n"
+            "/pause — silence background alerts\n"
+            "/resume — re-enable background alerts\n\n"
+            "<b>Monitor (direction-aware, strict by default):</b>\n"
             "• <i>Monitor SYN for bearish BOS</i>\n"
             "• <i>Watch ETH 4H for bullish sweep</i>\n"
-            "• <i>Stop monitoring BTC</i>\n\n"
-            "<b>Custom workflow (multi-step):</b>\n"
+            "• <i>Stop watching BTC</i>\n\n"
+            "<b>Custom workflow:</b>\n"
             "<i>Monitor SYN. H4 bearish. Wait for:\n"
-            "1. Bearish CHoCH\n2. Bearish BOS\n3. Sweep highs\n4. Bearish OB retest</i>\n\n"
-            "<b>Analysis:</b>\n"
-            "• <i>What's happening with BTC?</i>\n"
-            "• <i>Give me setups right now</i>\n"
-            "• <i>Best opportunities</i>"
+            "1. Bearish CHoCH\n2. Bearish BOS\n3. Sweep highs\n4. OB retest</i>\n\n"
+            "<b>Natural language:</b>\n"
+            "• <i>What's happening with ETH?</i>\n"
+            "• <i>Give me setups</i>\n"
+            "• <i>Show me top movers</i>\n"
+            "• <i>Pause alerts</i>  /  <i>Resume alerts</i>\n"
+            "• <i>What's on my watchlist?</i>\n"
+            "• <i>Clear my watchlist</i>"
         )
         return
 
@@ -354,29 +374,42 @@ def handle_update(update: dict) -> None:
     if text.startswith("/help"):
         send_message(chat_id,
             "<b>Scout — Command Reference</b>\n\n"
-            "<b>Setup discovery:</b>\n"
-            "/setups — auto-generate ranked setups with entry/SL/TP\n"
+            "<b>📊 Market</b>\n"
+            "/setups — A/A+ ranked setups, majors + MEXC movers, full trade plans\n"
             "/opportunities — same as /setups\n"
-            "/scan — run structure scan now\n\n"
-            "<b>Symbol analysis:</b>\n"
-            "/bias SOL — HTF bias, regime, sweeps, BOS, OB, FVG\n"
-            "/funding BTC — funding intelligence\n\n"
-            "<b>Market overview:</b>\n"
             "/majors — BTC/ETH/SOL/TON/BNB/XRP/SUI classifications\n"
             "/crimes — MEXC top 20 gainers + losers with classification\n"
-            "/movers — top 5 movers quick view\n\n"
-            "<b>Your monitors:</b>\n"
-            "/watchlist — view active monitors\n"
-            "/workflows — view active custom workflows\n"
-            "/clearwatchlist — remove all monitors\n"
+            "/movers — top 5 movers quick view\n"
+            "/scan — run structure scan now\n\n"
+            "<b>🔍 Analysis</b>\n"
+            "/bias SOL — full SMC: bias, regime, sweep, BOS, OB, FVG, trade plan\n"
+            "/funding BTC — funding rate, settlement countdown, risk label\n\n"
+            "<b>📋 Your monitors</b>\n"
+            "/watchlist — view active direction-aware monitors\n"
+            "/workflows — view active multi-stage workflows\n"
+            "/clearwatchlist — remove all monitors + workflows\n"
             "/history — alert log from 0G Storage\n\n"
+            "<b>⏸ Control</b>\n"
+            "/pause — silence all background alerts for this chat\n"
+            "/resume — re-enable background alerts\n\n"
             "<b>Monitoring (strict by default):</b>\n"
             "• <i>Monitor SYN for bearish BOS</i> — only fires on bearish BOS\n"
             "• <i>Watch BTC 4H for bullish sweep</i>\n"
-            "• <i>Monitor SOL for bearish BOS and tell me if you see anything else important</i> — assisted mode\n\n"
+            "• <i>Stop watching ETH</i>\n"
+            "• <i>Monitor SOL for bearish BOS and tell me anything else important</i> — assisted\n\n"
             "<b>Custom workflows:</b>\n"
             "<i>Monitor SYN. H4 bearish. Wait for:\n"
             "1. Bearish CHoCH\n2. Bearish BOS\n3. Sweep highs\n4. OB retest</i>\n\n"
+            "<b>Natural language equivalents:</b>\n"
+            "• <i>Give me setups</i> → /setups\n"
+            "• <i>Show me majors</i> → /majors\n"
+            "• <i>Top movers</i> → /movers\n"
+            "• <i>What's on my watchlist?</i> → /watchlist\n"
+            "• <i>Show my workflows</i> → /workflows\n"
+            "• <i>Clear my watchlist</i> → /clearwatchlist\n"
+            "• <i>Pause alerts</i> → /pause\n"
+            "• <i>Resume alerts</i> → /resume\n"
+            "• <i>What's happening with SOL?</i> → /bias SOL\n\n"
             "Powered by 0G Compute decentralised inference."
         )
         return
@@ -586,6 +619,121 @@ def handle_update(update: dict) -> None:
             send_message(chat_id, f"<b>Funding Rate — {symbol}</b>\n\n{f['read']}{warn}")
         return
 
+    # ── Natural language: bias + funding ─────────────────────────────────
+    # Patterns: "bias on SOL", "what's the bias for ETH", "analyse BTC",
+    #           "funding for BTC", "BTC funding", "what's BTC funding"
+
+    _BIAS_PHRASES = (
+        "bias on ", "bias for ", "what's the bias", "whats the bias",
+        "analyse ", "analyze ", "analysis on ", "analysis for ",
+        "structure on ", "structure for ", "read on ",
+        "what's happening with ", "whats happening with ",
+        "what is happening with ", "tell me about ",
+        "check ", "look at ", "what about ",
+    )
+    _FUNDING_PHRASES = (
+        "funding for ", "funding on ", "funding fee for ", "funding fee on ",
+        "funding rate for ", "funding rate on ",
+        "what's the funding", "whats the funding",
+        "funding ", "fee for ", "fee on ",
+    )
+
+    # Funding natural language — must check before bias (shorter phrases)
+    for phrase in _FUNDING_PHRASES:
+        if text_lower.startswith(phrase) or (
+            phrase.strip() in text_lower and len(text_lower) < 30
+        ):
+            # extract symbol from remainder or full text
+            remainder = text_lower.replace(phrase, "").strip()
+            raw = remainder.split()[0].upper() if remainder else ""
+            if not raw:
+                # try extracting from full text e.g. "BTC funding"
+                raw = _extract_symbol(text).replace("USDT", "") if _extract_symbol(text) else ""
+            if raw:
+                symbol = raw.replace("USDT", "") + "USDT"
+                from app.market_data import get_funding_intelligence
+                from app.mexc_data import get_funding_rate as mexc_funding
+                f = get_funding_intelligence(symbol)
+                if f.get("error"):
+                    try:
+                        fd = mexc_funding(symbol)
+                        if fd.get("ok"):
+                            rate    = fd["funding_rate"]
+                            next_ms = fd.get("next_settle_time", 0)
+                            mins    = max(0, (next_ms - int(time.time() * 1000)) // 60000) if next_ms else 999
+                            send_message(chat_id,
+                                f"<b>Funding — {symbol.replace('USDT','')} (MEXC)</b>\n\n"
+                                f"Rate: {rate*100:+.4f}%\n"
+                                f"Settlement in: {mins}min\n"
+                                f"{'Longs pay shorts' if rate > 0 else 'Shorts pay longs' if rate < 0 else 'Neutral'}"
+                            )
+                        else:
+                            send_message(chat_id, f"No funding data for {symbol}.")
+                    except Exception as fe:
+                        send_message(chat_id, f"Funding unavailable: {fe}")
+                else:
+                    warn = (
+                        "\n\nSETTLEMENT WARNING: under 30 minutes. Avoid new entries."
+                    ) if f.get("settlement_warning") else ""
+                    send_message(chat_id, f"<b>Funding — {symbol.replace('USDT','')}</b>\n\n{f['read']}{warn}")
+                return
+
+    # Also catch "BTC funding" / "ETH fee" pattern (symbol first)
+    _sym_first_funding = re.search(
+        r'^([A-Za-z]{2,10})\s+(funding|fee|funding fee|funding rate)$',
+        text_lower.strip()
+    )
+    if _sym_first_funding:
+        symbol = _sym_first_funding.group(1).upper() + "USDT"
+        from app.market_data import get_funding_intelligence
+        from app.mexc_data import get_funding_rate as mexc_funding
+        f = get_funding_intelligence(symbol)
+        if not f.get("error"):
+            warn = "\n\nSETTLEMENT WARNING: under 30 minutes." if f.get("settlement_warning") else ""
+            send_message(chat_id, f"<b>Funding — {symbol.replace('USDT','')}</b>\n\n{f['read']}{warn}")
+        else:
+            try:
+                fd = mexc_funding(symbol)
+                if fd.get("ok"):
+                    rate = fd["funding_rate"]
+                    next_ms = fd.get("next_settle_time", 0)
+                    mins = max(0, (next_ms - int(time.time()*1000)) // 60000) if next_ms else 999
+                    send_message(chat_id,
+                        f"<b>Funding — {symbol.replace('USDT','')}</b>\n\n"
+                        f"Rate: {rate*100:+.4f}%\n"
+                        f"Settlement: {mins}min\n"
+                        f"{'Longs pay' if rate > 0 else 'Shorts pay' if rate < 0 else 'Neutral'}"
+                    )
+                else:
+                    send_message(chat_id, f"No funding data for {symbol}.")
+            except Exception as fe:
+                send_message(chat_id, f"Funding unavailable: {fe}")
+        return
+
+    # Bias natural language
+    for phrase in _BIAS_PHRASES:
+        if text_lower.startswith(phrase):
+            remainder = text.replace(phrase, "").replace(phrase.title(), "").strip()
+            raw = remainder.split()[0].upper() if remainder else ""
+            if raw and len(raw) >= 2:
+                symbol = raw.replace("USDT", "") + "USDT"
+                send_message(chat_id, f"Analysing {symbol.replace('USDT','')}...")
+                reply = reasoning.explain_structure(symbol)
+                send_message(chat_id, reply)
+                return
+
+    # Also catch "SOL bias" / "ETH analysis" pattern (symbol first)
+    _sym_first_bias = re.search(
+        r'^([A-Za-z]{2,10})\s+(bias|analysis|structure|read|setup|view|outlook)$',
+        text_lower.strip()
+    )
+    if _sym_first_bias:
+        symbol = _sym_first_bias.group(1).upper() + "USDT"
+        send_message(chat_id, f"Analysing {symbol.replace('USDT','')}...")
+        reply = reasoning.explain_structure(symbol)
+        send_message(chat_id, reply)
+        return
+
     # ── /bias — P3 full trade setup ───────────────────────────────────────
     if text_lower.startswith("/bias"):
         parts = text.split()
@@ -599,6 +747,173 @@ def handle_update(update: dict) -> None:
         send_message(chat_id, f"Analysing {symbol.replace('USDT','')}...")
         reply = reasoning.explain_structure(symbol)
         send_message(chat_id, reply)
+        return
+
+    # ── Natural language command aliases ──────────────────────────────────
+    # These let the user speak naturally instead of using slash commands.
+
+    _nl = text_lower.strip()
+
+    # pause / resume
+    if _nl in ("pause", "pause alerts", "stop alerts", "mute alerts",
+                "silence alerts", "quiet mode", "mute"):
+        from app.scanner import pause_alerts
+        send_message(chat_id, pause_alerts(chat_id))
+        return
+
+    if _nl in ("resume", "resume alerts", "unmute", "unmute alerts",
+                "start alerts", "enable alerts", "turn alerts on"):
+        from app.scanner import resume_alerts
+        send_message(chat_id, resume_alerts(chat_id))
+        return
+
+    # setups
+    if any(_nl == w for w in (
+        "setups", "give me setups", "show me setups", "best setups",
+        "opportunities", "best opportunities", "any setups", "any trades",
+        "what should i trade", "find setups", "top setups", "good trades",
+    )):
+        send_message(chat_id, "⚡ Ranking setups... scanning market structure (~45s)")
+        try:
+            reply = reasoning.best_opportunities()
+            send_message(chat_id, reply)
+        except Exception as e:
+            send_message(chat_id, f"⚠️ Opportunity scan failed: {e}")
+        return
+
+    # majors
+    if any(_nl == w for w in (
+        "majors", "show majors", "major assets", "market overview",
+        "market snapshot", "show me majors", "how are majors", "market update",
+    )):
+        send_message(chat_id, "🔍 Fetching major asset intelligence...")
+        try:
+            from app.scanner import get_major_summary, run_major_asset_scan
+            summary = get_major_summary()
+            if "not yet loaded" in summary:
+                send_message(chat_id, "⏳ Running major scan now (~30s)...")
+                run_major_asset_scan()
+                summary = get_major_summary()
+            send_message(chat_id, summary)
+        except Exception as e:
+            send_message(chat_id, f"⚠️ Major scan failed: {e}")
+        return
+
+    # crimes / movers — delegate to existing handlers via redirect
+    if any(_nl == w for w in (
+        "crimes", "top movers", "movers", "show movers", "gainers and losers",
+        "gainers", "losers", "top gainers", "top losers", "show me movers",
+        "what's moving", "whats moving", "what is moving",
+    )):
+        if _nl in ("movers", "top movers", "show movers", "quick movers"):
+            from app.mexc_data import get_top_movers
+            mv = get_top_movers(top_n=5)
+            out = ["<b>MEXC Top Movers (24h)</b>", "", "Gainers"]
+            for m in mv["gainers"]:
+                out.append(f"  {m['symbol'].replace('_USDT','')}  {m['change_pct']:+.2f}%")
+            out.append("")
+            out.append("Losers")
+            for m in mv["losers"]:
+                out.append(f"  {m['symbol'].replace('_USDT','')}  {m['change_pct']:+.2f}%")
+            send_message(chat_id, "\n".join(out))
+        else:
+            # Full crimes view — reuse same logic as /crimes command
+            send_message(chat_id, "Fetching MEXC top movers...")
+            try:
+                from app.scanner import stamp_manual_crimes
+                stamp_manual_crimes()
+            except Exception:
+                pass
+            try:
+                tickers = _fetch_mexc_tickers()
+                if not tickers:
+                    send_message(chat_id, "MEXC data unavailable. Try again.")
+                    return
+                live     = [t for t in tickers if abs(t["change_pct"]) > 0.01] or tickers
+                sorted_t = sorted(live, key=lambda x: x["change_pct"])
+                losers   = sorted_t[:20]
+                gainers  = sorted_t[-20:][::-1]
+                g_lines  = ["TOP 20 GAINERS", ""]
+                for idx2, m in enumerate(gainers, 1):
+                    chg = m["change_pct"]
+                    tag = "HIGH" if chg > 20 else "WATCH" if chg > 10 else "UP"
+                    g_lines.append(f"{idx2}. {m['symbol']}  {chg:+.2f}%  [{tag}]")
+                l_lines = ["", "TOP 20 LOSERS", ""]
+                for idx2, m in enumerate(losers, 1):
+                    chg = m["change_pct"]
+                    tag = "DUMP" if chg < -20 else "WATCH" if chg < -10 else "DOWN"
+                    l_lines.append(f"{idx2}. {m['symbol']}  {chg:+.2f}%  [{tag}]")
+                send_message(chat_id, "\n".join(g_lines))
+                send_message(chat_id, "\n".join(l_lines))
+            except Exception as exc:
+                send_message(chat_id, f"MEXC fetch failed: {exc}")
+        return
+
+    # scan
+    if _nl in ("scan", "run scan", "scan now", "check structure",
+               "scan watchlist", "run structure scan"):
+        send_message(chat_id, "🔍 Scanning watchlist for structure events... (~30s)")
+        from app.scanner import run_structure_scan
+        run_structure_scan()
+        return
+
+    # watchlist
+    if any(_nl == w for w in (
+        "watchlist", "my watchlist", "show watchlist", "show my watchlist",
+        "what am i watching", "what are you watching", "my monitors",
+        "show monitors", "active monitors",
+    )):
+        from app.scanner import list_user_monitors
+        send_message(chat_id, list_user_monitors(chat_id))
+        return
+
+    # workflows
+    if any(_nl == w for w in (
+        "workflows", "my workflows", "show workflows", "show my workflows",
+        "active workflows", "what workflows", "my setups",
+    )):
+        from app import workflow as wf_mod
+        send_message(chat_id, wf_mod.list_workflows(chat_id))
+        return
+
+    # clear watchlist
+    if any(_nl == w for w in (
+        "clear watchlist", "clear my watchlist", "reset watchlist",
+        "remove all monitors", "clear monitors", "stop all monitors",
+        "clear all", "clear everything", "stop monitoring everything",
+        "remove all", "reset all monitors",
+    )):
+        from app.scanner import clear_all_monitors
+        from app import workflow as wf_mod
+        send_message(chat_id, clear_all_monitors(chat_id))
+        wf_mod.clear_workflows(chat_id)
+        return
+
+    # history
+    if _nl in ("history", "alert history", "past alerts", "show history",
+               "my history", "show alert history"):
+        send_message(chat_id, "Fetching alert history from 0G Storage...")
+        try:
+            from app.zg_storage import load_pointer, download
+            root = load_pointer()
+            if not root:
+                send_message(chat_id, "No history yet — Scout will build it as alerts fire.")
+                return
+            state = download(root)
+            log_entries = (state or {}).get("alert_log", [])
+            if not log_entries:
+                send_message(chat_id, "No alerts logged yet.")
+                return
+            recent = log_entries[-10:]
+            lines  = ["<b>Last 10 Scout Alerts (0G Storage)</b>\n"]
+            for e in reversed(recent):
+                ts  = e.get("ts", "")[:16].replace("T", " ")
+                typ = e.get("type", "").upper()
+                sym = e.get("symbol", "").replace("_USDT", "").replace("USDT", "")
+                lines.append(f"<b>{ts}</b>  {typ}  {sym}")
+            send_message(chat_id, "\n".join(lines))
+        except Exception as e:
+            send_message(chat_id, f"⚠️ History unavailable: {e}")
         return
 
     # ── Natural language: monitor / workflow (P1, P2, P5) ─────────────────
